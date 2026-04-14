@@ -7,7 +7,7 @@
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@500;700&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="assets/app.css?v=3">
+    <link rel="stylesheet" href="assets/app.css?v=4">
     <script src="https://unpkg.com/lucide@latest"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
@@ -25,6 +25,42 @@
                 <span id="statusText">Ready</span>
             </div>
 
+            <!-- MCP Mode Selector -->
+            <div class="mcp-selector-wrapper">
+                <label class="mcp-label">Active Integration</label>
+                <div class="mcp-dropdown" id="mcpDropdown">
+                    <button type="button" class="mcp-dropdown-btn" id="mcpDropdownBtn">
+                        <span id="mcpDropdownLabel">📧 Gmail MCP</span>
+                        <svg id="mcpChevronIcon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="transition:transform 0.2s;color:var(--text-muted);flex-shrink:0"><polyline points="6 9 12 15 18 9"/></svg>
+                    </button>
+                    <div class="mcp-dropdown-menu hidden" id="mcpDropdownMenu">
+                        <button type="button" class="mcp-option" data-value="general">
+                            <span class="mcp-option-icon">🤖</span>
+                            <span class="mcp-option-name">General Assistant</span>
+                        </button>
+                        <button type="button" class="mcp-option active" data-value="gmail">
+                            <span class="mcp-option-icon">📧</span>
+                            <span class="mcp-option-name">Gmail MCP</span>
+                        </button>
+                        <button type="button" class="mcp-option" data-value="drive">
+                            <span class="mcp-option-icon">📁</span>
+                            <span class="mcp-option-name">Drive MCP</span>
+                            <span class="mcp-coming-soon-badge">Soon</span>
+                        </button>
+                        <button type="button" class="mcp-option" data-value="docs">
+                            <span class="mcp-option-icon">📄</span>
+                            <span class="mcp-option-name">Google Docs MCP</span>
+                            <span class="mcp-coming-soon-badge">Soon</span>
+                        </button>
+                        <button type="button" class="mcp-option" data-value="sheets">
+                            <span class="mcp-option-icon">📊</span>
+                            <span class="mcp-option-name">Google Sheets MCP</span>
+                            <span class="mcp-coming-soon-badge">Soon</span>
+                        </button>
+                    </div>
+                </div>
+            </div>
+
 <div class="inbox-section">
                 <div class="inbox-header">
                     <h3>Inbox Overview</h3>
@@ -39,7 +75,10 @@
         <!-- Main Chat Area -->
         <main class="chat-area glass-panel">
             <div class="chat-header">
-                <h2>Assistant Chat</h2>
+                <div class="chat-header-info">
+                    <h2>Assistant Chat</h2>
+                    <span class="mode-badge" id="modeBadge">📧 Gmail MCP</span>
+                </div>
                 <button class="icon-btn"><i data-lucide="more-vertical"></i></button>
             </div>
             
@@ -83,7 +122,7 @@
         </div>
     </div>
 
-    <script src="assets/app.js?v=3"></script>
+    <script src="assets/app.js?v=4"></script>
     <script>
       lucide.createIcons();
     </script>
