@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>G-Assistant | Local AI Gmail Agent</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Outfit:wght@500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="assets/app.css?v=3">
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+</head>
+<body class="dark-mode">
+    <div class="app-container">
+        <!-- Sidebar -->
+        <aside class="sidebar glass-panel">
+            <div class="sidebar-header">
+                <i data-lucide="bot" class="logo-icon"></i>
+                <h1 class="logo-text">G-Assistant</h1>
+            </div>
+            
+            <div class="status-indicator ready" id="statusDot">
+                <div class="dot"></div>
+                <span id="statusText">Ready</span>
+            </div>
+
+<div class="inbox-section">
+                <div class="inbox-header">
+                    <h3>Inbox Overview</h3>
+                    <button class="icon-btn" id="refreshInbox" title="Refresh Inbox"><i data-lucide="refresh-cw"></i></button>
+                </div>
+                <div class="inbox-list" id="inboxList">
+                    <p class="loading-text">Loading inbox...</p>
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Chat Area -->
+        <main class="chat-area glass-panel">
+            <div class="chat-header">
+                <h2>Assistant Chat</h2>
+                <button class="icon-btn"><i data-lucide="more-vertical"></i></button>
+            </div>
+            
+            <div class="chat-history" id="chatHistory">
+                <div class="message assistant-msg">
+                    <div class="avatar"><i data-lucide="sparkles"></i></div>
+                    <div class="bubble">Hello! I am your local AI Gmail Assistant. How can I help you manage your inbox today?</div>
+                </div>
+            </div>
+
+            <div class="chat-input-wrapper">
+                <div class="thinking-animation hidden" id="thinkingAnim">
+                    <span></span><span></span><span></span>
+                </div>
+                <form id="chatForm" class="chat-form">
+                    <label for="fileUpload" class="attach-btn" title="Upload Attachment">
+                        <i data-lucide="paperclip"></i>
+                    </label>
+                    <input type="file" id="fileUpload" hidden />
+                    <input type="text" id="chatInput" placeholder="Ask G-Assistant to manage your emails..." autocomplete="off">
+                    <button type="submit" class="send-btn"><i data-lucide="send"></i></button>
+                </form>
+            </div>
+        </main>
+        
+        <!-- Email Modal -->
+        <div id="emailModal" class="modal-overlay hidden">
+            <div class="modal-content glass-panel">
+                <div class="modal-header">
+                    <h2 id="modalSubject">Email Details</h2>
+                    <button id="closeModal" class="icon-btn"><i data-lucide="x"></i></button>
+                </div>
+                <div class="modal-body">
+                    <div id="modalSender" class="modal-meta"><b>From:</b> <span></span></div>
+                    <div id="modalDate" class="modal-meta"><b>Date:</b> <span></span></div>
+                    <div id="modalLabels" class="modal-meta"><b>Labels:</b> <span></span></div>
+                    <hr class="modal-divider">
+                    <div id="modalBody" class="modal-text">Loading...</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="assets/app.js?v=3"></script>
+    <script>
+      lucide.createIcons();
+    </script>
+</body>
+</html>
