@@ -1,12 +1,41 @@
-import json
-import re
-from app.core.config import MAX_TOOL_LOOPS
+"""
+orchestrator.py — Production-level agent orchestration for G-Assistant.
 
-# ──────────────────────────────────────────────
-# Formatting helpers
-# ──────────────────────────────────────────────
-def _fmt(res_data):
-    """Recursively pretty-print MCP tool results as HTML."""
+Routing table
+─────────────
+  gmail          → Python intent router (zero-latency fast path) ─► LLM with Gmail tools
+  general        → LLM only, no tools
+  drive/docs/sheets → "coming soon" gate (bypassed when a file is attached)
+
+Attachment handling
+───────────────────
+  Documents (.docx, .txt, …) – text extracted by web.py, injected as inline context.
+  Images (.png, .jpg, …)     – base64 sent as vision content block on the first turn only;
+                               replaced with a slim text note in history to avoid context bloat.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+import datetime
+from typing import Optional
+
+from app.core.config import MAX_TOOL_LOOPS, MAX_HISTORY_MSG_CHARS
+
+# ─── top-level imports (not inside functions) ───────────────────────────────
+from app.core.llm_client import call_model                         # noqa: E402
+from app.integrations.gmail.registry import GMAIL_TOOLS           # noqa: E402
+
+logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTML formatting helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt(res_data: dict) -> str:
+    """Recursively render MCP tool results as HTML."""
     if not isinstance(res_data, dict) or "success" not in res_data:
         return str(res_data)
     if not res_data.get("success"):
@@ -15,88 +44,82 @@ def _fmt(res_data):
 
     res = res_data.get("result", "")
 
-    def _recurse(data):
+    def _recurse(data) -> str:
         if isinstance(data, list):
             if not data:
                 return "No results found."
-            blocks = []
-            for item in data:
-                blocks.append(
-                    f"<div style='padding:10px;margin:6px 0;"
-                    f"background:rgba(99,102,241,.1);border-left:3px solid "
-                    f"var(--primary);border-radius:4px'>{_recurse(item)}</div>"
-                )
-            return "".join(blocks)
-        elif isinstance(data, dict):
+            return "".join(
+                f"<div style='padding:10px;margin:6px 0;background:rgba(99,102,241,.1);"
+                f"border-left:3px solid var(--primary);border-radius:4px'>{_recurse(i)}</div>"
+                for i in data
+            )
+        if isinstance(data, dict):
             if "subject" in data and "from" in data:
                 sender = data.get("from", "").split("<")[0].strip()
-                subj   = data.get("subject", "(No Subject)")
-                snip   = data.get("snippet", "")
-                date   = data.get("date", "")
-                eid    = data.get("id", "")
                 return (
                     f"<b>From:</b> {sender}<br>"
-                    f"<b>Subject:</b> {subj}<br>"
-                    f"<span style='color:var(--text-muted);font-size:13px'>{snip}</span><br>"
-                    f"<span style='color:var(--text-muted);font-size:11px'>{date} · ID: {eid}</span>"
+                    f"<b>Subject:</b> {data.get('subject','(No Subject)')}<br>"
+                    f"<span style='color:var(--text-muted);font-size:13px'>{data.get('snippet','')}</span><br>"
+                    f"<span style='color:var(--text-muted);font-size:11px'>"
+                    f"{data.get('date','')} · ID: {data.get('id','')}</span>"
                 )
-            lines = []
-            for k, v in data.items():
-                if v not in (None, "", [], {}):
-                    lines.append(f"<b>{str(k).replace('_',' ').capitalize()}:</b> {_recurse(v)}")
+            lines = [
+                f"<b>{str(k).replace('_',' ').capitalize()}:</b> {_recurse(v)}"
+                for k, v in data.items() if v not in (None, "", [], {})
+            ]
             return "<br>".join(lines)
-        else:
-            return str(data).replace("\n", "<br>")
+        return str(data).replace("\n", "<br>")
 
     if isinstance(res, str):
         return res.replace("\n", "<br>")
     return _recurse(res)
 
 
-# ──────────────────────────────────────────────
-# Helpers
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Email helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 _EMAIL_RE = re.compile(r'[\w.+-]+@[\w-]+\.[a-zA-Z]{2,}')
 
-def _extract_email(text):
+_STOP_WORDS: frozenset[str] = frozenset({
+    "trash", "inbox", "drafts", "sent", "spam", "me", "my", "the", "it",
+    "them", "all", "please", "now", "this", "that", "here", "there",
+    "latest", "last", "first", "new", "old", "recent", "email", "mail",
+    "message", "hi", "hello", "thanks", "ok", "sure", "yes", "no",
+    "a", "an", "and", "or", "of", "to", "for", "is", "in", "on",
+    "at", "by", "up", "do", "go", "get", "give", "show", "read",
+    "check", "find", "search", "help", "can", "you", "i", "we",
+    "one", "any", "some", "just", "about", "with", "from", "reply",
+    "forward", "delete", "send", "write", "compose", "draft", "make",
+    "create", "open", "see", "view", "look", "fetch", "retrieve",
+})
+
+
+def _extract_email(text: str) -> Optional[str]:
     m = _EMAIL_RE.search(text)
     return m.group(0) if m else None
 
-def _is_real_recipient(word):
-    """Return True only if `word` looks like a real email/username — not a common English word."""
-    STOP_WORDS = {
-        "trash", "inbox", "drafts", "sent", "spam", "me", "my", "the", "it",
-        "them", "all", "please", "now", "this", "that", "here", "there",
-        "latest", "last", "first", "new", "old", "recent", "email", "mail",
-        "message", "hi", "hello", "thanks", "ok", "sure", "yes", "no",
-        "a", "an", "and", "or", "of", "to", "for", "is", "in", "on",
-        "at", "by", "up", "do", "go", "get", "give", "show", "read",
-        "check", "find", "search", "help", "can", "you", "i", "we",
-        "one", "any", "some", "just", "about", "with", "from", "reply",
-        "forward", "delete", "send", "write", "compose", "draft", "make",
-        "create", "open", "see", "view", "look", "fetch", "retrieve",
-    }
+
+def _is_real_recipient(word: str) -> bool:
+    """True only if *word* looks like a real email/username, not a common English word."""
     if not word or len(word) < 2:
         return False
-    if word.lower() in STOP_WORDS:
+    if word.lower() in _STOP_WORDS:
         return False
-    # Must either contain @ (proper email) or look like a username/domain
     if "@" in word:
         return bool(_EMAIL_RE.match(word))
-    # Accept only if it looks like a name/username (letters, dots, underscores, hyphens)
-    if re.match(r'^[a-zA-Z][\w.\-]{2,}$', word):
-        return True
-    return False
+    return bool(re.match(r'^[a-zA-Z][\w.\-]{2,}$', word))
 
 
-# ──────────────────────────────────────────────
-# Intent detection  (no LLM needed)
-# ──────────────────────────────────────────────
-def _intent_detect(text, mcp, state):
-    """Return reply_text or None (fall through to LLM)."""
+# ─────────────────────────────────────────────────────────────────────────────
+# Intent detection  (no LLM needed — O(1) latency for common Gmail commands)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _intent_detect(text: str, mcp, state: dict) -> Optional[str]:
+    """Return an HTML reply string, or None to fall through to the LLM."""
     low = text.lower().strip()
 
-    # ── Greetings / capability questions ────────
+    # ── Greetings ────────────────────────────────────────────────────────────
     if re.match(r'^(hi+|hello+|hey+|howdy|greetings?|good\s*(morning|afternoon|evening))[\s!?.]*$', low):
         return (
             "👋 <b>Hi! I'm G-Assistant, your Gmail AI.</b><br><br>"
@@ -111,126 +134,126 @@ def _intent_detect(text, mcp, state):
             "Just tell me what you need!"
         )
 
-    if re.search(r'\b(what can you do|what do you do|help me|your (features?|capabilities?|abilities?)|how (do i|can i) use)\b', low):
+    # ── Capability questions ─────────────────────────────────────────────────
+    if re.search(
+        r'\b(what can you do|what do you do|help me|your (features?|capabilities?|abilities?)'
+        r'|how (do i|can i) use)\b', low
+    ):
         return (
             "🤖 <b>G-Assistant capabilities:</b><br><br>"
             "<b>📬 Reading emails:</b><br>"
-            "• <code>read my emails</code> · <code>show inbox</code> · <code>check unread</code> · <code>starred emails</code><br><br>"
+            "• <code>read my emails</code> · <code>show inbox</code> · "
+            "<code>check unread</code> · <code>starred emails</code><br><br>"
             "<b>🔍 Searching:</b><br>"
-            "• <code>find emails from john@example.com</code> · <code>search emails about invoice</code><br><br>"
+            "• <code>find emails from john@example.com</code> · "
+            "<code>search emails about invoice</code><br><br>"
             "<b>✉️ Sending / Drafting:</b><br>"
             "• <code>send email to john@example.com saying Hello!</code><br>"
             "• <code>draft email to alice@example.com saying Meeting tomorrow</code><br><br>"
             "<b>🗑️ Deleting / Archiving:</b><br>"
-            "• <code>delete the latest email</code> · <code>trash email [ID]</code> · <code>archive email [ID]</code><br><br>"
+            "• <code>delete the latest email</code> · <code>trash email [ID]</code> · "
+            "<code>archive email [ID]</code><br><br>"
             "<b>↩️ Replying / Forwarding:</b><br>"
-            "• <code>reply to [ID] saying Thanks!</code> · <code>forward [ID] to bob@example.com</code><br><br>"
+            "• <code>reply to [ID] saying Thanks!</code> · "
+            "<code>forward [ID] to bob@example.com</code><br><br>"
             "<b>📋 AI features:</b><br>"
             "• <code>summarize email [ID]</code> · <code>classify email [ID]</code><br><br>"
             "<b>🏷️ Labels:</b><br>"
-            "• <code>list labels</code> · <code>create label work</code> · <code>add label work to [ID]</code>"
+            "• <code>list labels</code> · <code>create label work</code> · "
+            "<code>add label work to [ID]</code>"
         )
 
-    # ── Read latest / single email ───────────────
+    # ── Read latest email ────────────────────────────────────────────────────
     if re.search(
         r'\b(?:get|fetch|show|give|retrieve|find|read)\s+(?:me\s+)?(?:the\s+)?'
         r'(?:latest|last|most\s+recent|newest|first|top|recent)\s+(?:email|mail|message)\b', low
     ):
         res = mcp.execute_tool("get_emails", {"limit": 1})
-        ids = [e['id'] for e in res.get('result', []) if isinstance(e, dict) and 'id' in e]
-        state["last_viewed_ids"] = ids
+        state["last_viewed_ids"] = _ids_from(res)
         return f"Here is your latest email:<br><br>{_fmt(res)}"
 
-    # ── Read inbox (broad — many natural phrasings) ──
-    if re.search(
-        r'\b(?:read|show|check|open|get|display|list|fetch|give me|see)\s+'
-        r'(?:me\s+)?(?:my\s+|all\s+|the\s+)?(?:inbox|emails?|mails?|messages?)\b', low
-    ) or re.search(r'\b(?:my\s+emails?|my\s+inbox|my\s+mails?|my\s+messages?)\b', low) \
-      or low in ("emails", "inbox", "mail", "messages"):
+    # ── Read inbox ───────────────────────────────────────────────────────────
+    if (
+        re.search(
+            r'\b(?:read|show|check|open|get|display|list|fetch|give me|see)\s+'
+            r'(?:me\s+)?(?:my\s+|all\s+|the\s+)?(?:inbox|emails?|mails?|messages?)\b', low
+        )
+        or re.search(r'\b(?:my\s+emails?|my\s+inbox|my\s+mails?|my\s+messages?)\b', low)
+        or low in {"emails", "inbox", "mail", "messages"}
+    ):
         res = mcp.execute_tool("get_emails", {"limit": 10})
-        ids = [e['id'] for e in res.get('result', []) if isinstance(e, dict) and 'id' in e]
-        state["last_viewed_ids"] = ids
+        state["last_viewed_ids"] = _ids_from(res)
         return f"Here are your latest emails:<br><br>{_fmt(res)}"
 
-    # ── Unread emails ────────────────────────────
+    # ── Unread ───────────────────────────────────────────────────────────────
     if re.search(r'\b(?:unread|unseen)\s*(?:emails?|mails?|messages?)?\b', low) \
        or re.search(r'\bemails?\s+(?:i\s+)?(?:haven\'t\s+read|not\s+read)\b', low):
         res = mcp.execute_tool("get_unread_emails", {})
-        ids = [e['id'] for e in res.get('result', []) if isinstance(e, dict) and 'id' in e]
-        state["last_viewed_ids"] = ids
+        state["last_viewed_ids"] = _ids_from(res)
         return f"Your unread emails:<br><br>{_fmt(res)}"
 
-    # ── Starred emails ───────────────────────────
+    # ── Starred ──────────────────────────────────────────────────────────────
     if re.search(r'\b(?:starred|important|flagged)\s*(?:emails?|mails?|messages?)?\b', low):
         res = mcp.execute_tool("get_starred_emails", {})
-        ids = [e['id'] for e in res.get('result', []) if isinstance(e, dict) and 'id' in e]
-        state["last_viewed_ids"] = ids
+        state["last_viewed_ids"] = _ids_from(res)
         return f"Your starred emails:<br><br>{_fmt(res)}"
 
-    # ── Last week emails ─────────────────────────
+    # ── Last week ────────────────────────────────────────────────────────────
     if re.search(r'\blast\s+week\b', low):
-        from datetime import datetime, timedelta
-        today = datetime.utcnow()
-        start = (today - timedelta(days=7)).strftime("%Y/%m/%d")
+        today = datetime.datetime.utcnow()
+        start = (today - datetime.timedelta(days=7)).strftime("%Y/%m/%d")
         end   = today.strftime("%Y/%m/%d")
         res = mcp.execute_tool("get_emails_by_date_range", {"start": start, "end": end})
-        ids = [e['id'] for e in res.get('result', []) if isinstance(e, dict) and 'id' in e]
-        state["last_viewed_ids"] = ids
+        state["last_viewed_ids"] = _ids_from(res)
         return f"Emails from the last week:<br><br>{_fmt(res)}"
 
-    # ── Today's emails ───────────────────────────
+    # ── Today ────────────────────────────────────────────────────────────────
     if re.search(r'\btoday\b', low) and re.search(r'\b(?:email|mail|message)\b', low):
-        from datetime import datetime
-        today = datetime.utcnow().strftime("%Y/%m/%d")
+        today = datetime.datetime.utcnow().strftime("%Y/%m/%d")
         res = mcp.execute_tool("search_emails", {"query": f"after:{today}", "limit": 10})
-        ids = [e['id'] for e in res.get('result', []) if isinstance(e, dict) and 'id' in e]
-        state["last_viewed_ids"] = ids
+        state["last_viewed_ids"] = _ids_from(res)
         return f"Emails from today:<br><br>{_fmt(res)}"
 
-    # ── Bulk delete all tracked emails ──────────
-    if re.search(r'\b(?:delete|trash|remove)\s+(?:all|all\s+of\s+(?:these|them|those)|these|them|those)\b', low):
+    # ── Bulk delete ──────────────────────────────────────────────────────────
+    if re.search(
+        r'\b(?:delete|trash|remove)\s+(?:all|all\s+of\s+(?:these|them|those)|these|them|those)\b', low
+    ):
         ids = state.get("last_viewed_ids", [])
         if not ids:
-            return "⚠️ I don't have any emails tracked. Try saying <b>'show my emails'</b> first, then ask me to delete them."
-        ok, fail = 0, 0
+            return "⚠️ No emails tracked. Say <b>'show my emails'</b> first, then delete them."
+        ok = fail = 0
         for mid in ids:
-            res = mcp.execute_tool("trash_email", {"message_id": mid})
-            if res.get("success") is not False:
+            r = mcp.execute_tool("trash_email", {"message_id": mid})
+            if r.get("success") is not False:
                 ok += 1
             else:
                 fail += 1
         state["last_viewed_ids"] = []
-        return f"🗑️ Moved <b>{ok}</b> email(s) to trash.{(' ⚠️ ' + str(fail) + ' failed.') if fail else ''}"
+        return f"🗑️ Moved <b>{ok}</b> email(s) to trash.{f' ⚠️ {fail} failed.' if fail else ''}"
 
-    # ── Delete latest / first / last one ────────
-    m_pos = re.search(
-        r'\b(?:delete|trash|remove)\s+(?:the\s+)?(?P<pos>first|last|latest|most\s+recent|newest)\s+'
-        r'(?:one|mail|email|message)\b', low
+    # ── Delete by position ───────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:delete|trash|remove)\s+(?:the\s+)?'
+        r'(?P<pos>first|last|latest|most\s+recent|newest)\s+(?:one|mail|email|message)\b', low
     )
-    if m_pos:
-        ids = state.get("last_viewed_ids", [])
-        if not ids:
-            res = mcp.execute_tool("get_emails", {"limit": 1})
-            ids = [e['id'] for e in res.get('result', []) if isinstance(e, dict) and 'id' in e]
-            state["last_viewed_ids"] = ids
+    if m:
+        ids = state.get("last_viewed_ids") or _ids_from(mcp.execute_tool("get_emails", {"limit": 1}))
+        state["last_viewed_ids"] = ids
         if not ids:
             return "⚠️ Couldn't retrieve any emails to delete."
-        pos = m_pos.group("pos")
+        pos = m.group("pos")
         target = ids[-1] if pos in ("last", "latest", "most recent", "newest") else ids[0]
         mcp.execute_tool("trash_email", {"message_id": target})
         return f"🗑️ Email <b>{target}</b> moved to trash."
 
-    # ── Move / Trash latest ──────────────────────
+    # ── Move latest to trash ─────────────────────────────────────────────────
     if re.search(
-        r'\b(?:move|put|trash)\s+(?:it|this|the\s+(?:latest|last|first|email|mail|message))?\s*(?:to\s+)?trash\b', low
+        r'\b(?:move|put|trash)\s+(?:it|this|the\s+(?:latest|last|first|email|mail|message))?\s*(?:to\s+)?trash\b',
+        low
     ) or re.search(
         r'\bdelete\s+(?:the\s+)?(?:latest|last|most\s+recent)\s+(?:email|mail|message)\b', low
     ):
-        ids = state.get("last_viewed_ids", [])
-        if not ids:
-            res = mcp.execute_tool("get_emails", {"limit": 1})
-            ids = [e['id'] for e in res.get('result', []) if isinstance(e, dict) and 'id' in e]
-            state["last_viewed_ids"] = ids
+        ids = state.get("last_viewed_ids") or _ids_from(mcp.execute_tool("get_emails", {"limit": 1}))
         if not ids:
             return "⚠️ Couldn't fetch any emails to trash."
         target = ids[0]
@@ -238,128 +261,125 @@ def _intent_detect(text, mcp, state):
         state["last_viewed_ids"] = ids[1:]
         return f"🗑️ Moved email <b>{target}</b> to trash."
 
-    # ── Delete / Trash / Archive / Star by explicit hex ID ──
-    m = re.search(r'\b(?:delete|trash|remove)\s+(?:this\s+|it\s+|the\s+(?:email|mail)\s+)?([a-fA-F0-9]{10,})\b', low)
-    if not m:
-        m = re.search(r'\b(?:trash|delete)\s+(?:email\s+|message\s+)?([a-fA-F0-9]{10,})\b', low)
+    # ── Delete by explicit hex ID ─────────────────────────────────────────────
+    m = (
+        re.search(r'\b(?:delete|trash|remove)\s+(?:this\s+|it\s+|the\s+(?:email|mail)\s+)?([a-fA-F0-9]{10,})\b', low)
+        or re.search(r'\b(?:trash|delete)\s+(?:email\s+|message\s+)?([a-fA-F0-9]{10,})\b', low)
+        or re.search(r'\b(?:delete|trash|remove)\s+(?:this|it)\b.*?([a-fA-F0-9]{10,})', low)
+        or re.search(r'([a-fA-F0-9]{10,}).*?\b(?:delete|trash|remove)\s+(?:this|it)\b', low)
+    )
     if m:
         msg_id = m.group(1)
         res = mcp.execute_tool("trash_email", {"message_id": msg_id})
         return f"🗑️ Email <b>{msg_id}</b> moved to trash.<br><br>{_fmt(res)}"
 
-    # "delete this" when an ID is visible nearby
-    m = re.search(r'\b(?:delete|trash|remove)\s+(?:this|it)\b.*?([a-fA-F0-9]{10,})', low)
-    if not m:
-        m = re.search(r'([a-fA-F0-9]{10,}).*?\b(?:delete|trash|remove)\s+(?:this|it)\b', low)
-    if m:
-        msg_id = m.group(1)
-        res = mcp.execute_tool("trash_email", {"message_id": msg_id})
-        return f"🗑️ Done! Email <b>{msg_id}</b> moved to trash.<br><br>{_fmt(res)}"
-
-    # ── Read / Show a specific email by ID ──────
+    # ── Read specific email by ID ─────────────────────────────────────────────
     m = re.search(r'\b(?:show|read|open|view|get|fetch)\s+(?:email\s+|message\s+)?([a-fA-F0-9]{10,})\b', low)
     if m:
-        msg_id = m.group(1)
-        res = mcp.execute_tool("get_email_by_id", {"message_id": msg_id})
+        res = mcp.execute_tool("get_email_by_id", {"message_id": m.group(1)})
         return f"Email Details:<br><br>{_fmt(res)}"
 
-    # ── Summarize ─────────────────────────────────
+    # ── Summarize ────────────────────────────────────────────────────────────
     m = re.search(r'\bsummariz[ei]\w*\s+(?:email\s+|message\s+)?([a-fA-F0-9]{10,})\b', low)
     if m:
         email_obj = mcp.execute_tool("get_email_by_id", {"message_id": m.group(1)})
         res = mcp.execute_tool("summarize_email", {"email": str(email_obj.get("result", email_obj))})
         return f"📋 Summary:<br><br>{_fmt(res)}"
 
-    # ── Reply ────────────────────────────────────
+    # ── Reply ────────────────────────────────────────────────────────────────
     m = re.search(r'\breply(?:\s+to)?\s+([a-fA-F0-9]{10,})\s+(?:saying|with)?\s*(.*)', low)
     if m:
-        msg_id = m.group(1)
-        body   = m.group(2).strip() or "Thank you!"
-        res = mcp.execute_tool("reply_email", {"message_id": msg_id, "body": body})
+        res = mcp.execute_tool("reply_email", {
+            "message_id": m.group(1),
+            "body": m.group(2).strip() or "Thank you!"
+        })
         return f"✅ Reply sent!<br><br>{_fmt(res)}"
 
-    # ── Forward ───────────────────────────────────
+    # ── Forward ──────────────────────────────────────────────────────────────
     m = re.search(r'\bforward\s+(?:email\s+|message\s+)?([a-fA-F0-9]{10,})\s+to\s+([\w.@+\-]+)', low)
     if m and _is_real_recipient(m.group(2)):
         res = mcp.execute_tool("forward_email", {"message_id": m.group(1), "to": m.group(2)})
         return f"↗️ Forwarded!<br><br>{_fmt(res)}"
 
-    # ── Star / Unstar ─────────────────────────────
+    # ── Star / Unstar ────────────────────────────────────────────────────────
     m = re.search(r'\b(star|unstar)\s+(?:email\s+|message\s+)?([a-fA-F0-9]{10,})\b', low)
     if m:
         tool = "star_email" if m.group(1) == "star" else "unstar_email"
         res = mcp.execute_tool(tool, {"message_id": m.group(2)})
         return f"⭐ Done!<br><br>{_fmt(res)}"
 
-    # ── Archive ───────────────────────────────────
+    # ── Archive ──────────────────────────────────────────────────────────────
     m = re.search(r'\barchive\s+(?:email\s+|message\s+)?([a-fA-F0-9]{10,})\b', low)
     if m:
         res = mcp.execute_tool("archive_email", {"message_id": m.group(1)})
         return f"📦 Archived!<br><br>{_fmt(res)}"
 
-    # ── Mark read/unread ─────────────────────────
+    # ── Mark read / unread ───────────────────────────────────────────────────
     m = re.search(r'\bmark\s+([a-fA-F0-9]{10,})\s+as\s+(read|unread)\b', low)
     if m:
         tool = "mark_as_read" if m.group(2) == "read" else "mark_as_unread"
         res = mcp.execute_tool(tool, {"message_id": m.group(1)})
         return f"✅ Marked as {m.group(2)}.<br><br>{_fmt(res)}"
 
-    # ── Labels ────────────────────────────────────
+    # ── List labels ──────────────────────────────────────────────────────────
     if re.search(r'\b(?:list|show|get|view)\s+(?:all\s+)?labels?\b', low):
         res = mcp.execute_tool("list_labels", {})
         return f"Your Gmail labels:<br><br>{_fmt(res)}"
 
+    # ── Create label ─────────────────────────────────────────────────────────
     m = re.search(r'\bcreate\s+(?:a\s+)?label\s+(?:called|named)?\s*["\']?([^\s"\'?]+)["\']?', low)
     if m:
         name = m.group(1).lower()
         res = mcp.execute_tool("create_label", {"label_name": name})
-        is_success = res.get("success", False)
-        res_data = res.get("result", {})
-        if is_success and isinstance(res_data, dict) and "note" in res_data:
+        success   = res.get("success", False)
+        res_data  = res.get("result", {})
+        if success and isinstance(res_data, dict) and "note" in res_data:
             return f"⚠️ <b>{name}</b><br><br>{_fmt(res)}"
-        elif is_success and not (isinstance(res_data, dict) and "error" in res_data):
+        if success and not (isinstance(res_data, dict) and "error" in res_data):
             return f"🏷️ Label <b>{name}</b> created!<br><br>{_fmt(res)}"
         return f"Result for <b>{name}</b>:<br><br>{_fmt(res)}"
 
+    # ── Add label to email ───────────────────────────────────────────────────
     m = re.search(r'\badd\s+label\s+["\']?([^\s"\']+)["\']?\s+to\s+([a-fA-F0-9]{10,})\b', low)
     if m:
         res = mcp.execute_tool("add_label", {"message_id": m.group(2), "label": m.group(1)})
         return f"✅ Label added!<br><br>{_fmt(res)}"
 
-    # ── Search / Find emails by sender ──────────
-    # Must have a real email address or explicit "from X" with a plausible name
+    # ── Labels on an email ───────────────────────────────────────────────────
+    m = re.search(r'\b(?:labels?|tags?)\s+(?:on|of|for)\s+(?:email\s+)?([a-fA-F0-9]{10,})\b', low)
+    if m:
+        email = mcp.execute_tool("get_email_by_id", {"message_id": m.group(1)})
+        labels = email.get("result", {}).get("labels", []) if isinstance(email, dict) else []
+        return f"Labels: <b>{', '.join(labels) if labels else 'None'}</b>"
+
+    # ── Search by sender ─────────────────────────────────────────────────────
     email_in_text = _extract_email(text)
     if email_in_text and re.search(r'\b(?:from|by|emails?\s+from|messages?\s+from)\b', low):
         res = mcp.execute_tool("search_emails", {"query": f"from:{email_in_text}", "limit": 10})
-        ids = [e['id'] for e in res.get('result', []) if isinstance(e, dict) and 'id' in e]
-        state["last_viewed_ids"] = ids
+        state["last_viewed_ids"] = _ids_from(res)
         return f"Emails from <b>{email_in_text}</b>:<br><br>{_fmt(res)}"
 
-    # "emails from NAME" — only if NAME looks like a real sender
     m = re.search(r'\b(?:emails?\s+from|messages?\s+from|from)\s+([^\s,?!.]+)', low)
-    if m:
+    if m and _is_real_recipient(m.group(1)):
         sender = m.group(1)
-        if _is_real_recipient(sender):
-            res = mcp.execute_tool("search_emails", {"query": f"from:{sender}", "limit": 10})
-            ids = [e['id'] for e in res.get('result', []) if isinstance(e, dict) and 'id' in e]
-            state["last_viewed_ids"] = ids
-            return f"Emails from <b>{sender}</b>:<br><br>{_fmt(res)}"
+        res = mcp.execute_tool("search_emails", {"query": f"from:{sender}", "limit": 10})
+        state["last_viewed_ids"] = _ids_from(res)
+        return f"Emails from <b>{sender}</b>:<br><br>{_fmt(res)}"
 
-    # "search emails about X" / "find emails with subject Y"
+    # ── Search by keyword / subject ──────────────────────────────────────────
     m = re.search(
-        r'\b(?:search|find|look\s+for)\s+(?:emails?\s+|messages?\s+)?(?:about|with\s+subject|regarding|with\s+keyword|containing)\s+(.+)',
-        low
+        r'\b(?:search|find|look\s+for)\s+(?:emails?\s+|messages?\s+)?'
+        r'(?:about|with\s+subject|regarding|with\s+keyword|containing)\s+(.+)', low
     )
     if m:
         q = m.group(1).strip().strip('"\'')
         if len(q) > 2:
             res = mcp.execute_tool("search_emails", {"query": q, "limit": 10})
-            ids = [e['id'] for e in res.get('result', []) if isinstance(e, dict) and 'id' in e]
-            state["last_viewed_ids"] = ids
+            state["last_viewed_ids"] = _ids_from(res)
             return f"Search results for <b>{q}</b>:<br><br>{_fmt(res)}"
 
-    # ── Compose / Send email ─────────────────────
-    # Pattern 1: "send/compose/write/draft email to X@Y.Z saying ..."
+    # ── Compose / Send / Draft ───────────────────────────────────────────────
+    # Covers: "send/draft/compose/write email to X saying Y"
     compose_m = re.search(
         r'\b(?:send|create|write|compose|draft|make)\s+(?:an?\s+)?(?:email|mail|message)\s+to\s+([\w.@+\-]+)'
         r'(?:\s+(?:saying|with\s+(?:body|message|subject)|about|:))?\s*(.*)',
@@ -368,7 +388,7 @@ def _intent_detect(text, mcp, state):
     if compose_m and not _is_real_recipient(compose_m.group(1)):
         compose_m = None
 
-    # Pattern 2: "email to X@Y.Z saying ..."  (only with full email address or clear username)
+    # Covers: "email to X saying Y"
     if not compose_m:
         m_tmp = re.search(
             r'\bemail\s+to\s+([\w.@+\-]+)(?:\s+(?:saying|with|about|:))?\s*(.*)',
@@ -379,54 +399,83 @@ def _intent_detect(text, mcp, state):
 
     if compose_m:
         to   = _extract_email(text) or compose_m.group(1)
-        body = compose_m.group(2).strip() if compose_m.lastindex >= 2 else ""
-        body = body or "Hello!"
-        subject = body[:60].split(".")[0].strip() if body else "Message from G-Assistant"
-        args = {"to": to, "subject": subject, "body": body}
+        body = (compose_m.group(2) or "").strip() or "Hello!"
+        subject = body[:60].split(".")[0].strip() or "Message from G-Assistant"
+        args: dict = {"to": to, "subject": subject, "body": body}
         if state.get("last_attachment_path"):
             args["attachment_path"] = state.pop("last_attachment_path")
 
-        # Detect action word
-        action_word = re.search(r'\b(create|write|compose|draft|make|send)\b', low)
-        action = action_word.group(1) if action_word else "send"
+        action_m = re.search(r'\b(create|write|compose|draft|make|send)\b', low)
+        action = action_m.group(1) if action_m else "send"
         if action in ("create", "write", "compose", "draft", "make"):
-            res = mcp.execute_tool("draft_email", args)
+            res    = mcp.execute_tool("draft_email", args)
             result = res.get("result", {}) if isinstance(res, dict) else {}
-            did = result.get("id", "") if isinstance(result, dict) else ""
+            did    = result.get("id", "") if isinstance(result, dict) else ""
             if did:
-                state["last_draft_id"] = did
-                state["last_to"] = to
-                state["last_body"] = body
-                state["last_subject"] = subject
+                state.update(last_draft_id=did, last_to=to, last_body=body, last_subject=subject)
             return f"📝 Draft created to <b>{to}</b>!<br>Draft ID: <code>{did}</code><br>Say <b>'send it'</b> to send."
-        else:
+        res = mcp.execute_tool("send_email", args)
+        return f"✅ Email sent to <b>{to}</b>!<br><br>{_fmt(res)}"
+
+    # ── Draft (extended — handles "create a draft for [mail/email] to X ...") ─
+    # This catches phrasings like:
+    #   "create a draft for mail to X asking Y"
+    #   "draft a mail to X saying Y"
+    #   "make a draft for email to X about Y"
+    m = re.search(
+        r'\b(?:create|make|write|compose|draft)\s+(?:a\s+)?draft'
+        r'(?:\s+for)?(?:\s+(?:an?\s+)?(?:email|mail|message))?'
+        r'\s+to\s+([\w.@+\-]+)'
+        r'\s*(.*)',
+        low, re.DOTALL
+    )
+    if not m:
+        # Also catches: "draft a mail/email to X ..."
+        m = re.search(
+            r'\b(?:draft|write|compose|send)\s+(?:an?\s+)?(?:email|mail|message)\s+to\s+([\w.@+\-]+)'
+            r'\s*(.*)',
+            low, re.DOTALL
+        )
+    if m and _is_real_recipient(m.group(1)):
+        to      = _extract_email(text) or m.group(1)
+        body    = (m.group(2) or "").strip() or "Hello!"
+        subject = body[:60].split(".")[0].strip() or "Draft"
+        args    = {"to": to, "subject": subject, "body": body}
+        if state.get("last_attachment_path"):
+            args["attachment_path"] = state.pop("last_attachment_path")
+        action_m = re.search(r'\b(send)\b', low)
+        if action_m and action_m.group(1) == "send":
             res = mcp.execute_tool("send_email", args)
             return f"✅ Email sent to <b>{to}</b>!<br><br>{_fmt(res)}"
+        res      = mcp.execute_tool("draft_email", args)
+        result   = res.get("result", {}) if isinstance(res, dict) else {}
+        draft_id = result.get("id", "") if isinstance(result, dict) else ""
+        if draft_id:
+            state.update(last_draft_id=draft_id, last_to=to, last_body=body, last_subject=subject)
+        return f"📝 Draft created to <b>{to}</b>!<br>Draft ID: <code>{draft_id}</code><br>Say <b>'send it'</b> to dispatch."
 
-    # ── Draft / Create email (alternate phrasing) ─
+    # ── Draft (alternate phrasing — "create a draft to/for X directly") ──────
     m = re.search(
-        r'\b(?:create|make|write|compose)\s+(?:a\s+)?draft\s+(?:to|for)\s+([\w.@+-]+)\s+(?:saying|with body|:)?\s*(.*)',
-        low
+        r'\b(?:create|make|write|compose)\s+(?:a\s+)?draft\s+(?:to|for)\s+([\w.@+-]+)'
+        r'\s+(?:saying|with body|:)?\s*(.*)', low
     )
     if m and _is_real_recipient(m.group(1)):
         to   = _extract_email(text) or m.group(1)
         body = m.group(2).strip() or "Hello!"
-        subject = body[:50] if body else "Draft from G-Assistant"
+        subject = body[:50] or "Draft from G-Assistant"
         args = {"to": to, "subject": subject, "body": body}
         if state.get("last_attachment_path"):
             args["attachment_path"] = state.pop("last_attachment_path")
         res = mcp.execute_tool("draft_email", args)
-        result = res.get("result", {}) if isinstance(res, dict) else {}
-        draft_id = result.get("id", "")
-        state["last_draft_id"] = draft_id
-        state["last_to"]       = to
-        state["last_body"]     = body
-        state["last_subject"]  = subject
+        result   = res.get("result", {}) if isinstance(res, dict) else {}
+        draft_id = result.get("id", "") if isinstance(result, dict) else ""
+        state.update(last_draft_id=draft_id, last_to=to, last_body=body, last_subject=subject)
         return f"✅ Draft created to <b>{to}</b>!<br>Draft ID: <code>{draft_id}</code><br>Say <b>'send it'</b> to dispatch."
 
-    # ── "send it" / "send that" / "send the draft" ─
-    if re.search(r'^\s*(?:send|send\s+it|send\s+that|send\s+the\s+(?:draft|mail|email))\s*$', low) or \
-       re.search(r'\b(?:send\s+it|send\s+that|send\s+the\s+(?:draft|mail|email))\b', low):
+    # ── Send queued draft ────────────────────────────────────────────────────
+    if re.search(
+        r'^\s*(?:send|send\s+it|send\s+that|send\s+the\s+(?:draft|mail|email))\s*$', low
+    ) or re.search(r'\b(?:send\s+it|send\s+that|send\s+the\s+(?:draft|mail|email))\b', low):
         draft_id = state.get("last_draft_id")
         if draft_id:
             res = mcp.execute_tool("send_draft", {"draft_id": draft_id})
@@ -443,72 +492,187 @@ def _intent_detect(text, mcp, state):
             return f"✅ Email sent to <b>{to}</b>!<br><br>{_fmt(res)}"
         return "I don't have a draft queued. Say <b>send email to [address] saying [message]</b>."
 
-    # ── "delete it" / "discard draft" ─────────────
-    if re.search(r'\b(?:delete\s+(?:the\s+)?last\s+draft|delete\s+it|discard\s+it|discard\s+(?:the\s+)?draft)\b', low):
+    # ── Discard draft ────────────────────────────────────────────────────────
+    if re.search(
+        r'\b(?:delete\s+(?:the\s+)?last\s+draft|delete\s+it|discard\s+it|discard\s+(?:the\s+)?draft)\b', low
+    ):
         draft_id = state.get("last_draft_id")
         if draft_id:
-            res = mcp.execute_tool("delete_draft", {"draft_id": draft_id})
+            mcp.execute_tool("delete_draft", {"draft_id": draft_id})
             state.pop("last_draft_id", None)
             return "🗑️ Draft deleted."
         return "I don't have a record of your last draft to delete."
 
-    # ── User pasted raw ID with "-> send" ─────────
+    # ── Raw ID → send ─────────────────────────────────────────────────────────
     m = re.search(r'\b(r[\d]{10,})\s*[-=]>\s*(?:send|dispatch)', low)
     if m:
-        draft_id = m.group(1)
-        res = mcp.execute_tool("send_draft", {"draft_id": draft_id})
-        return f"✅ Draft {draft_id} sent!<br><br>{_fmt(res)}"
+        res = mcp.execute_tool("send_draft", {"draft_id": m.group(1)})
+        return f"✅ Draft {m.group(1)} sent!<br><br>{_fmt(res)}"
 
-    # ── List labels on an email ───────────────────
-    m = re.search(r'\b(?:labels?|tags?)\s+(?:on|of|for)\s+(?:email\s+)?([a-fA-F0-9]{10,})\b', low)
-    if m:
-        email = mcp.execute_tool("get_email_by_id", {"message_id": m.group(1)})
-        labels = email.get("result", {}).get("labels", []) if isinstance(email, dict) else []
-        return f"Labels: <b>{', '.join(labels) if labels else 'None'}</b>"
+    # ── Contextual draft — "draft for the same / for this / for it" ──────────
+    # No recipient in the message; rely on last_to saved from a previous interaction.
+    if re.search(
+        r'\b(?:create|make|write|compose|draft)\s+(?:a\s+)?draft'
+        r'(?:\s+for)?(?:\s+(?:the\s+)?(?:same|this|it|above|that))?\s*$', low
+    ) or re.search(
+        r'\b(?:draft|write|compose)\s+(?:an?\s+)?(?:email|mail|reply|message)'
+        r'\s+(?:for\s+)?(?:the\s+)?(?:same|this|it|above|that)\b', low
+    ):
+        to   = state.get("last_to", "")
+        body = state.get("last_body", "Hello!")
+        subj = state.get("last_subject", "Follow-up")
+        if to:
+            args = {"to": to, "subject": subj, "body": body}
+            if state.get("last_attachment_path"):
+                args["attachment_path"] = state.pop("last_attachment_path")
+            res = mcp.execute_tool("draft_email", args)
+            result   = res.get("result", {}) if isinstance(res, dict) else {}
+            draft_id = result.get("id", "") if isinstance(result, dict) else ""
+            if draft_id:
+                state["last_draft_id"] = draft_id
+            return (
+                f"📝 Draft created for <b>{to}</b>!<br>"
+                f"Draft ID: <code>{draft_id}</code><br>Say <b>'send it'</b> to dispatch."
+            )
+        # No previous recipient — let LLM handle it (it will ask for clarification)
 
-    return None   # fall through to LLM
+    return None  # fall through to LLM
 
 
-# ──────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# Utility: extract email IDs from a tool result
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ids_from(res: dict) -> list[str]:
+    return [e["id"] for e in res.get("result", []) if isinstance(e, dict) and "id" in e]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LLM tool-call extraction
-# ──────────────────────────────────────────────
-def _parse_tool_call(content):
-    m = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
-    snippet = m.group(1) if m else content
+# ─────────────────────────────────────────────────────────────────────────────
 
-    m2 = re.search(r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*(\{.*?\})\s*\}', snippet, re.DOTALL)
-    if m2:
+def _parse_tool_call(content: str) -> Optional[dict]:
+    """Extract a JSON tool-call block from the LLM response, or return None."""
+    # Prefer fenced ```json … ``` blocks
+    fence = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
+    snippet = fence.group(1) if fence else content
+
+    # Try regex extraction first (more tolerant of surrounding text)
+    m = re.search(
+        r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*(\{.*?\})\s*\}',
+        snippet, re.DOTALL
+    )
+    if m:
         try:
-            return {"tool": m2.group(1), "args": json.loads(m2.group(2))}
-        except json.JSONDecodeError:
+            return {"tool": m.group(1), "args": json.loads(m.group(2))}
+        except (json.JSONDecodeError, ValueError):
             pass
 
+    # Fall back to full JSON parse
     try:
         data = json.loads(snippet.strip())
         if isinstance(data, dict) and "tool" in data:
             return data
-    except:
+    except (json.JSONDecodeError, ValueError):
         pass
 
     return None
 
 
-# ──────────────────────────────────────────────
-# Main entry point
-# ──────────────────────────────────────────────
-SYSTEM_PROMPT_TEMPLATE = """You are G-Assistant, a smart and helpful AI Gmail assistant.
+# ─────────────────────────────────────────────────────────────────────────────
+# History management
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _content_len(content) -> int:
+    """Return approximate character length of a message content field."""
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        return sum(len(c.get("text", "")) for c in content if isinstance(c, dict))
+    return 0
+
+
+def _truncate_content(content: str, limit: int) -> str:
+    if len(content) > limit:
+        return content[:limit] + " …[truncated]"
+    return content
+
+
+def _append_to_history(history: list, role: str, content, *, char_limit: int = MAX_HISTORY_MSG_CHARS) -> None:
+    """
+    Append a message, truncating oversized string content to stay within
+    the per-message character budget.  Vision content lists are stored as-is
+    (they are slimmed separately after the first LLM call).
+    """
+    if isinstance(content, str):
+        content = _truncate_content(content, char_limit)
+    history.append({"role": role, "content": content})
+
+
+def _trim_history(history: list, max_messages: int = 31) -> list:
+    """
+    Keep the system message plus the most recent (max_messages-1) turns.
+    Returns a new list; does NOT mutate the original.
+    """
+    if len(history) <= max_messages:
+        return history
+    return [history[0]] + history[-(max_messages - 1):]
+
+
+def _slim_vision_entry(history: list, image_name: str) -> None:
+    """
+    After the first LLM call, replace the base64 image_url content block with
+    a plain-text placeholder so subsequent calls don't resend the raw bytes.
+    """
+    for i, msg in enumerate(history):
+        content = msg.get("content")
+        if isinstance(content, list) and any(
+            isinstance(c, dict) and c.get("type") == "image_url" for c in content
+        ):
+            text_parts = " ".join(
+                c.get("text", "") for c in content if isinstance(c, dict) and c.get("type") == "text"
+            )
+            history[i] = {
+                "role": msg["role"],
+                "content": f"{text_parts}\n[Image attached: {image_name}]"
+            }
+            break
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# System prompts
+# ─────────────────────────────────────────────────────────────────────────────
+
+_GMAIL_SYSTEM_PROMPT = """\
+You are G-Assistant operating in Gmail MCP mode.
 
 Context:
 - Current date: {current_date}
 - Recently listed email IDs: {viewed_ids}
 - Last draft ID: {last_draft_id}
 
-Instructions:
-1. For Gmail actions, output ONLY a JSON tool call — no explanation before it.
-2. If the user says "these", "them", "the last one" and viewed_ids is set, use those IDs.
-3. If viewed_ids is None and you need an ID, call get_emails(limit=1) first.
-4. For general questions (not Gmail actions), reply normally in plain English.
+RULES:
+1. Your primary job is Gmail/email actions. When in doubt about whether a request is
+   email-related, ALWAYS attempt a Gmail tool call — do not refuse.
+   Examples of things you SHOULD handle:
+     • "create a draft for the same" → draft an email based on prior context
+     • "write a reply" / "reply to it" → reply_email using viewed_ids
+     • "forward that" → forward_email using viewed_ids
+     • "send it" → send the last draft
+     • "create a draft for mail to X asking Y" → draft_email
+   Only redirect if the request is completely unrelated to email and has no
+   possible email interpretation (e.g. "solve this math problem", "write a poem
+   about cats", "what is the capital of France"). Redirect those with EXACTLY:
+   "I'm in **Gmail MCP** mode — I can only help with your emails. \
+Switch to **General Assistant** in the sidebar for other questions."
+2. Analysing an attached file/image is ALWAYS allowed — users need to understand
+   documents before composing emails about them.
+3. For Gmail actions output ONLY a JSON tool call — no explanation before it.
+4. If the user says "these"/"them"/"the last one"/"same"/"it" and viewed_ids is set,
+   use those IDs. If viewed_ids is None but you need an ID, call get_emails first.
 5. NEVER call send_email unless the user provided a clear recipient email address.
+   For ambiguous requests like "create a draft for the same", use draft_email with
+   to="" and body based on context, or ask for the recipient.
 
 Tool call format (use ONLY this):
 ```json
@@ -519,80 +683,185 @@ Available Tools:
 {tool_list}
 """
 
+_GENERAL_SYSTEM_PROMPT = """\
+You are G-Assistant, a helpful and knowledgeable AI assistant.
+Current date: {current_date}
 
-def run_agent(user_input, mcp, state):
-    # ── Fast Python intent router ───────────────
-    intent_reply = _intent_detect(user_input, mcp, state)
-    if intent_reply is not None:
-        return intent_reply
+- Answer questions clearly and concisely.
+- If the user shares a document, its full text is embedded in the message — read it carefully.
+- If the user shares an image, analyse it thoroughly.
+- You are NOT connected to email or any Google services in this mode.
+"""
 
-    # ── LLM fallback ────────────────────────────
-    from app.core.llm_client import call_model
-    from app.integrations.gmail.registry import GMAIL_TOOLS
-    import datetime
+_ATTACHMENT_PROMPT = """\
+You are G-Assistant.
+Current date: {current_date}
 
-    tl = "\n".join([f"- {k}" for k in GMAIL_TOOLS.keys()])
-    v_ids = state.get("last_viewed_ids", [])
-    d_id  = state.get("last_draft_id", "None")
-    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+The user is in **{mode_name}** mode (coming soon) but has attached a file or image.
+Analyse the attached content thoroughly and answer their question.
+At the end, briefly note that the {mode_name} integration is still in development.
+"""
 
-    sys_prompt = SYSTEM_PROMPT_TEMPLATE.format(
-        current_date=now_str,
-        viewed_ids=", ".join(v_ids) if v_ids else "None",
-        last_draft_id=d_id,
-        tool_list=tl
+_COMING_SOON_PROMPT = """\
+You are G-Assistant operating in {mode_name} mode.
+Current date: {current_date}
+
+This integration is not yet available. For EVERY message respond with EXACTLY:
+"**{mode_name}** is coming soon! Switch to **Gmail MCP** or **General Assistant** in the sidebar."
+Do NOT answer any other questions.
+"""
+
+_MODE_NAMES: dict[str, str] = {
+    "drive":  "Google Drive MCP",
+    "docs":   "Google Docs MCP",
+    "sheets": "Google Sheets MCP",
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Attachment detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _has_attachment(user_input: str, image_state: Optional[dict]) -> bool:
+    return (
+        image_state is not None
+        or "--- Attached file:" in user_input
+        or "[User attached image:" in user_input
     )
 
-    if "history" not in state:
-        state["history"] = [{"role": "system", "content": sys_prompt}]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
+    """
+    Route the user message to the correct handler and return an HTML reply string.
+
+    Parameters
+    ----------
+    user_input : str
+        Raw user message (may contain injected file content from web.py).
+    mcp        : MCPServer
+        Tool executor instance.
+    state      : dict
+        Mutable per-session state (history, last IDs, draft cache, etc.).
+    mode       : str
+        Active integration: "gmail" | "general" | "drive" | "docs" | "sheets".
+    """
+    now_str     = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    image_state = state.pop("last_image", None)      # consumed here; web.py sets this
+    attachment  = _has_attachment(user_input, image_state)
+
+    # ── Fast path: Gmail intent router (bypassed when a file is attached) ────
+    if mode == "gmail" and not attachment:
+        intent_reply = _intent_detect(user_input, mcp, state)
+        if intent_reply is not None:
+            return intent_reply
+
+    # ── Build mode-specific system prompt ────────────────────────────────────
+    if mode == "gmail":
+        tool_list  = "\n".join(f"- {k}" for k in GMAIL_TOOLS)
+        v_ids      = state.get("last_viewed_ids", [])
+        d_id       = state.get("last_draft_id", "None")
+        sys_prompt = _GMAIL_SYSTEM_PROMPT.format(
+            current_date=now_str,
+            viewed_ids=", ".join(v_ids) if v_ids else "None",
+            last_draft_id=d_id,
+            tool_list=tool_list,
+        )
+    elif mode == "general":
+        sys_prompt = _GENERAL_SYSTEM_PROMPT.format(current_date=now_str)
     else:
-        state["history"][0] = {"role": "system", "content": sys_prompt}
+        mode_name  = _MODE_NAMES.get(mode, mode.title() + " MCP")
+        sys_prompt = (
+            _ATTACHMENT_PROMPT.format(current_date=now_str, mode_name=mode_name)
+            if attachment
+            else _COMING_SOON_PROMPT.format(current_date=now_str, mode_name=mode_name)
+        )
 
-    state["history"].append({"role": "user", "content": user_input})
+    # ── Per-mode conversation history ─────────────────────────────────────────
+    hist_key = f"history_{mode}"
+    if hist_key not in state:
+        state[hist_key] = [{"role": "system", "content": sys_prompt}]
+    else:
+        state[hist_key][0] = {"role": "system", "content": sys_prompt}  # refresh context
 
-    if len(state["history"]) > 31:
-        state["history"] = [state["history"][0]] + state["history"][-30:]
+    history = state[hist_key]
 
-    reply_text = ""
+    # ── Build user message (vision block or plain text) ───────────────────────
+    if image_state:
+        vision_content = [
+            {"type": "text", "text": user_input},
+            {"type": "image_url", "image_url": {
+                "url": f"data:{image_state['mime']};base64,{image_state['data']}"
+            }}
+        ]
+        history.append({"role": "user", "content": vision_content})
+    else:
+        _append_to_history(history, "user", user_input)
+
+    # ── Trim history to avoid context overflow ────────────────────────────────
+    trimmed = _trim_history(history)
+    if trimmed is not history:
+        state[hist_key] = trimmed
+        history = trimmed
+
+    # ── LLM inference loop ────────────────────────────────────────────────────
+    reply_text    = ""
+    vision_slimmed = False
+
     for _ in range(MAX_TOOL_LOOPS):
         try:
-            resp    = call_model(state["history"])
-            msg     = resp.get("choices", [{}])[0].get("message", {})
-            content = msg.get("content", "")
-            state["history"].append(msg)
+            resp    = call_model(history)
+            llm_msg = resp.get("choices", [{}])[0].get("message", {})
+            content = llm_msg.get("content") or ""
 
-            tool_call = _parse_tool_call(content)
-            if tool_call:
-                tool_name = tool_call["tool"]
-                args      = tool_call.get("args", {})
-                if state.get("last_attachment_path") and tool_name in ["send_email", "draft_email"]:
-                    args["attachment_path"] = state.pop("last_attachment_path")
-                res = mcp.execute_tool(tool_name, args)
-                if tool_name == "draft_email" and isinstance(res, dict):
-                    did = res.get("result", {}).get("id") if isinstance(res.get("result"), dict) else None
-                    if did:
-                        state["last_draft_id"] = did
-                state["history"].append({
-                    "role": "user",
-                    "content": f"Tool result: {json.dumps(res)}"
-                })
-                continue
+            # Slim down vision entry after first successful call
+            if image_state and not vision_slimmed:
+                _slim_vision_entry(history, image_state["name"])
+                vision_slimmed = True
 
-            reply_text = content
+            # Append assistant turn (truncated to avoid history bloat)
+            _append_to_history(history, "assistant",
+                               content if isinstance(content, str) else json.dumps(content))
+
+            # Tool execution (Gmail mode only)
+            if mode == "gmail" and isinstance(content, str):
+                tool_call = _parse_tool_call(content)
+                if tool_call:
+                    tool_name = tool_call["tool"]
+                    args      = tool_call.get("args", {})
+                    if state.get("last_attachment_path") and tool_name in ("send_email", "draft_email"):
+                        args["attachment_path"] = state.pop("last_attachment_path")
+                    res = mcp.execute_tool(tool_name, args)
+                    if tool_name == "draft_email" and isinstance(res, dict):
+                        did = (res.get("result") or {}).get("id") if isinstance(res.get("result"), dict) else None
+                        if did:
+                            state["last_draft_id"] = did
+                    _append_to_history(history, "user", f"Tool result: {json.dumps(res)}")
+                    continue  # next loop iteration → send tool result back to LLM
+
+            reply_text = content if isinstance(content, str) else json.dumps(content)
             break
 
-        except Exception as e:
-            reply_text = f"<b style='color:#ef4444'>Error:</b> {e}"
+        except Exception:
+            logger.exception("LLM call failed (mode=%s)", mode)
+            reply_text = (
+                "<b style='color:#ef4444'>Error:</b> The assistant encountered a problem. "
+                "Please try again."
+            )
             break
 
+    # ── Fallback: format the last tool result if LLM loop exhausted ──────────
     if not reply_text:
-        last = state["history"][-1].get("content", "") if state["history"] else ""
-        if "Tool result:" in last:
+        last_content = history[-1].get("content", "") if history else ""
+        if isinstance(last_content, str) and "Tool result:" in last_content:
             try:
-                raw = last.split("Tool result: ", 1)[1]
+                raw = last_content.split("Tool result: ", 1)[1]
                 reply_text = _fmt(json.loads(raw))
-            except:
-                reply_text = last
+            except (json.JSONDecodeError, ValueError, IndexError):
+                reply_text = last_content
         else:
             reply_text = "I wasn't able to complete that. Please try rephrasing your request."
 
