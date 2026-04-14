@@ -27,6 +27,7 @@ from app.core.config import MAX_TOOL_LOOPS, MAX_HISTORY_MSG_CHARS
 # ─── top-level imports (not inside functions) ───────────────────────────────
 from app.core.llm_client import call_model                         # noqa: E402
 from app.integrations.gmail.registry import GMAIL_TOOLS           # noqa: E402
+from app.integrations.docs.registry import DOCS_TOOLS             # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -650,6 +651,7 @@ Context:
 - Current date: {current_date}
 - Recently listed email IDs: {viewed_ids}
 - Last draft ID: {last_draft_id}
+- Last recipient: {last_to}
 
 RULES:
 1. Your primary job is Gmail/email actions. When in doubt about whether a request is
@@ -711,9 +713,232 @@ This integration is not yet available. For EVERY message respond with EXACTLY:
 Do NOT answer any other questions.
 """
 
+_DOCS_SYSTEM_PROMPT = """\
+You are G-Assistant operating in Google Docs MCP mode.
+
+Context:
+- Date: {current_date}
+- Recent document IDs: {viewed_doc_ids}
+
+YOUR JOB: Convert the user's request into a single JSON tool call for Google Docs.
+Output ONLY the JSON block — no text before or after it.
+
+```json
+{{"tool": "TOOL_NAME", "args": {{"key": "value"}}}}
+```
+
+INFORMATION EXTRACTION:
+- DOCUMENT ID: Extract from URLs (the long string between /d/ and /edit), direct IDs, or use recent IDs above.
+- TITLE: Use as-is from user request; "about X" → title = "X"
+- CONTENT: When creating/appending, write full professional content based on the user's intent.
+  e.g. "a meeting agenda for Monday" → write a proper formatted agenda
+
+CONTEXT REFERENCES:
+- "it" / "that doc" / "the document" / "this" → use first ID from Recent document IDs
+- "the last one" / "same" → use first ID from Recent document IDs
+
+AVAILABLE TOOLS:
+{tool_list}
+
+TOOL GUIDE:
+- list_docs(limit)                         → list recent docs
+- search_docs(query, limit)                → full-text search across all docs
+- get_doc(doc_id)                          → read a document's full content
+- get_doc_content(doc_id)                  → read just the text
+- create_doc(title, content)               → create a new document
+- append_to_doc(doc_id, text)              → add text at end of document
+- replace_text_in_doc(doc_id, find, replace) → find & replace in document
+- update_doc_title(doc_id, new_title)      → rename a document
+- delete_doc(doc_id)                       → move document to trash
+
+RULES:
+1. ALWAYS attempt a tool call for any Docs-related request. Never refuse.
+2. When content is a description, GENERATE proper content — don't echo the user's instruction.
+3. Only redirect for completely unrelated topics (math, email, cooking):
+   "I'm in **Google Docs MCP** mode. Switch to **General Assistant** for non-Docs questions."
+"""
+
+# Google Doc IDs: base64url, typically 44 chars (alphanumeric + _ + -)
+_DOC_ID_RE = re.compile(r'[a-zA-Z0-9_-]{25,}')
+
+
+def _extract_doc_id(text: str) -> Optional[str]:
+    """Pull a Google Doc ID from a URL or standalone string."""
+    # From URL: /document/d/DOC_ID/
+    url_m = re.search(r'/document/d/([a-zA-Z0-9_-]{25,})', text)
+    if url_m:
+        return url_m.group(1)
+    m = _DOC_ID_RE.search(text)
+    return m.group(0) if m else None
+
+
+def _fmt_docs(res_data: dict) -> str:
+    """Render Docs tool results as HTML."""
+    if not isinstance(res_data, dict) or "success" not in res_data:
+        return str(res_data)
+    if not res_data.get("success"):
+        return f"<b style='color:#ef4444'>Error:</b> {res_data.get('error', 'Unknown error')}"
+
+    res = res_data.get("result", "")
+
+    def _render(data) -> str:
+        if isinstance(data, list):
+            if not data:
+                return "No documents found."
+            items = []
+            for doc in data:
+                if isinstance(doc, dict):
+                    url   = doc.get("url", "")
+                    title = doc.get("title", "(Untitled)")
+                    mod   = doc.get("modified", "")[:10] if doc.get("modified") else ""
+                    link  = f"<a href='{url}' target='_blank' style='color:var(--primary)'>{title}</a>" if url else f"<b>{title}</b>"
+                    items.append(
+                        f"<div style='padding:8px 10px;margin:5px 0;background:rgba(99,102,241,.08);"
+                        f"border-left:3px solid var(--primary);border-radius:4px'>"
+                        f"{link}<br>"
+                        f"<span style='color:var(--text-muted);font-size:12px'>ID: {doc.get('id','')}"
+                        f"{' · ' + mod if mod else ''}</span></div>"
+                    )
+                else:
+                    items.append(str(doc))
+            return "".join(items)
+        if isinstance(data, dict):
+            if "text" in data and "title" in data:
+                url   = data.get("url", "")
+                title = data.get("title", "(Untitled)")
+                link  = f"<a href='{url}' target='_blank' style='color:var(--primary)'>{title}</a>" if url else f"<b>{title}</b>"
+                text_preview = data["text"][:600].replace("\n", "<br>") if data["text"] else "(empty)"
+                return (
+                    f"<b>Document:</b> {link}<br>"
+                    f"<span style='color:var(--text-muted);font-size:12px'>ID: {data.get('id','')}</span><br><br>"
+                    f"<div style='font-size:13px;border-top:1px solid rgba(255,255,255,0.08);padding-top:8px'>"
+                    f"{text_preview}</div>"
+                )
+            lines = [f"<b>{k.replace('_',' ').capitalize()}:</b> {_render(v)}"
+                     for k, v in data.items() if v not in (None, "", [], {})]
+            return "<br>".join(lines)
+        return str(data).replace("\n", "<br>")
+
+    if isinstance(res, str):
+        return res.replace("\n", "<br>")
+    return _render(res)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Google Docs intent router  (zero-latency fast path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _docs_intent_detect(text: str, mcp, state: dict) -> Optional[str]:
+    """Return an HTML reply string, or None to fall through to the LLM."""
+    low  = text.lower().strip()
+    dids = state.get("last_viewed_doc_ids", [])
+
+    # ── Greetings ────────────────────────────────────────────────────────────
+    if re.match(r'^(hi+|hello+|hey+|howdy|greetings?)[\s!?.]*$', low):
+        return (
+            "👋 <b>Hi! I'm G-Assistant in Google Docs mode.</b><br><br>"
+            "Here's what I can do:<br>"
+            "• <b>List</b> your recent documents<br>"
+            "• <b>Search</b> docs by title or content<br>"
+            "• <b>Read</b> any document<br>"
+            "• <b>Create</b> a new document<br>"
+            "• <b>Append</b> text to an existing document<br>"
+            "• <b>Find & Replace</b> text in a document<br>"
+            "• <b>Rename</b> or <b>Delete</b> documents<br><br>"
+            "Just tell me what you need!"
+        )
+
+    # ── List recent docs ──────────────────────────────────────────────────────
+    if re.search(
+        r'\b(?:list|show|get|fetch|display|see|view)\s+(?:my\s+|all\s+|recent\s+)?'
+        r'(?:google\s+)?docs?(?:uments?)?\b', low
+    ) or low in {"docs", "documents", "my docs", "recent docs"}:
+        res = mcp.execute_tool("list_docs", {"limit": 10})
+        ids = [d["id"] for d in (res.get("result") or []) if isinstance(d, dict)]
+        state["last_viewed_doc_ids"] = ids
+        return f"Your recent Google Docs:<br><br>{_fmt_docs(res)}"
+
+    # ── Search docs ───────────────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:search|find|look\s+for)\s+(?:(?:google\s+)?docs?\s+)?'
+        r'(?:about|with|containing|for|titled?|named?|regarding)?\s+["\']?(.+?)["\']?\s*$', low
+    )
+    if m:
+        q = m.group(1).strip()
+        if len(q) > 1 and q not in ("doc", "docs", "document", "documents"):
+            res = mcp.execute_tool("search_docs", {"query": q, "limit": 10})
+            ids = [d["id"] for d in (res.get("result") or []) if isinstance(d, dict)]
+            state["last_viewed_doc_ids"] = ids
+            return f"Search results for <b>{q}</b>:<br><br>{_fmt_docs(res)}"
+
+    # ── Read / open a doc ─────────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:open|read|show|view|get|fetch|display)\s+(?:doc(?:ument)?\s+)?'
+        r'([a-zA-Z0-9_-]{25,})\b', text
+    )
+    if not m:
+        # URL form
+        m = re.search(r'/document/d/([a-zA-Z0-9_-]{25,})', text)
+    if m:
+        doc_id = m.group(1)
+        res    = mcp.execute_tool("get_doc", {"doc_id": doc_id})
+        state["last_viewed_doc_ids"] = [doc_id]
+        return f"Document contents:<br><br>{_fmt_docs(res)}"
+
+    # ── Create a new doc ──────────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:create|make|new|write)\s+(?:a\s+)?(?:new\s+)?(?:google\s+)?doc(?:ument)?'
+        r'(?:\s+(?:called|named|titled?|about|:))?\s+["\']?(.+?)["\']?\s*$', low
+    )
+    if m:
+        title = m.group(1).strip().title()
+        res   = mcp.execute_tool("create_doc", {"title": title, "content": ""})
+        if isinstance(res.get("result"), dict):
+            state["last_viewed_doc_ids"] = [res["result"].get("id", "")]
+        return f"📄 Document created!<br><br>{_fmt_docs(res)}"
+
+    # ── Append text to a doc ──────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:append|add|insert|write)\s+(?:to\s+)?(?:doc(?:ument)?\s+)?'
+        r'([a-zA-Z0-9_-]{25,})\s*[:\-–]?\s*(.*)', text, re.DOTALL
+    )
+    if m:
+        doc_id = m.group(1)
+        text_to_add = m.group(2).strip() or "..."
+        res = mcp.execute_tool("append_to_doc", {"doc_id": doc_id, "text": text_to_add})
+        return f"✅ Text appended!<br><br>{_fmt_docs(res)}"
+
+    # ── Rename a doc ──────────────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:rename|retitle)\s+(?:doc(?:ument)?\s+)?([a-zA-Z0-9_-]{25,})\s+'
+        r'(?:to|as)\s+["\']?(.+?)["\']?\s*$', low
+    )
+    if m:
+        doc_id    = m.group(1)
+        new_title = m.group(2).strip()
+        res = mcp.execute_tool("update_doc_title", {"doc_id": doc_id, "new_title": new_title})
+        return f"✏️ Document renamed to <b>{new_title}</b>.<br><br>{_fmt_docs(res)}"
+
+    # ── Delete / trash a doc ──────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:delete|trash|remove)\s+(?:doc(?:ument)?\s+)?([a-zA-Z0-9_-]{25,})\b', text
+    )
+    if m:
+        doc_id = m.group(1)
+        res    = mcp.execute_tool("delete_doc", {"doc_id": doc_id})
+        return f"🗑️ Document moved to trash.<br><br>{_fmt_docs(res)}"
+
+    # ── "Open last / show it" — contextual ───────────────────────────────────
+    if re.search(r'\b(?:open|read|show)\s+(?:it|that|this|the\s+(?:last|same)\s+one)\b', low):
+        if dids:
+            res = mcp.execute_tool("get_doc", {"doc_id": dids[0]})
+            return f"Document contents:<br><br>{_fmt_docs(res)}"
+
+    return None  # fall through to LLM
+
+
 _MODE_NAMES: dict[str, str] = {
     "drive":  "Google Drive MCP",
-    "docs":   "Google Docs MCP",
     "sheets": "Google Sheets MCP",
 }
 
@@ -753,9 +978,14 @@ def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
     image_state = state.pop("last_image", None)      # consumed here; web.py sets this
     attachment  = _has_attachment(user_input, image_state)
 
-    # ── Fast path: Gmail intent router (bypassed when a file is attached) ────
+    # ── Fast path: intent routers (bypassed when a file is attached) ─────────
     if mode == "gmail" and not attachment:
         intent_reply = _intent_detect(user_input, mcp, state)
+        if intent_reply is not None:
+            return intent_reply
+
+    if mode == "docs" and not attachment:
+        intent_reply = _docs_intent_detect(user_input, mcp, state)
         if intent_reply is not None:
             return intent_reply
 
@@ -768,6 +998,15 @@ def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
             current_date=now_str,
             viewed_ids=", ".join(v_ids) if v_ids else "None",
             last_draft_id=d_id,
+            last_to=state.get("last_to") or "None",
+            tool_list=tool_list,
+        )
+    elif mode == "docs":
+        tool_list  = "\n".join(f"- {k}" for k in DOCS_TOOLS)
+        d_ids      = state.get("last_viewed_doc_ids", [])
+        sys_prompt = _DOCS_SYSTEM_PROMPT.format(
+            current_date=now_str,
+            viewed_doc_ids=", ".join(d_ids) if d_ids else "None",
             tool_list=tool_list,
         )
     elif mode == "general":
@@ -826,19 +1065,36 @@ def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
             _append_to_history(history, "assistant",
                                content if isinstance(content, str) else json.dumps(content))
 
-            # Tool execution (Gmail mode only)
-            if mode == "gmail" and isinstance(content, str):
+            # Tool execution (Gmail and Docs modes)
+            if mode in ("gmail", "docs") and isinstance(content, str):
                 tool_call = _parse_tool_call(content)
                 if tool_call:
                     tool_name = tool_call["tool"]
                     args      = tool_call.get("args", {})
-                    if state.get("last_attachment_path") and tool_name in ("send_email", "draft_email"):
+
+                    # Gmail-specific: attach file if pending
+                    if mode == "gmail" and state.get("last_attachment_path") \
+                            and tool_name in ("send_email", "draft_email"):
                         args["attachment_path"] = state.pop("last_attachment_path")
+
                     res = mcp.execute_tool(tool_name, args)
-                    if tool_name == "draft_email" and isinstance(res, dict):
+
+                    # Gmail-specific: cache draft ID
+                    if mode == "gmail" and tool_name == "draft_email" and isinstance(res, dict):
                         did = (res.get("result") or {}).get("id") if isinstance(res.get("result"), dict) else None
                         if did:
                             state["last_draft_id"] = did
+
+                    # Docs-specific: cache last viewed doc IDs
+                    if mode == "docs" and isinstance(res, dict):
+                        result_data = res.get("result")
+                        if isinstance(result_data, list):
+                            ids = [d["id"] for d in result_data if isinstance(d, dict) and "id" in d]
+                            if ids:
+                                state["last_viewed_doc_ids"] = ids
+                        elif isinstance(result_data, dict) and "id" in result_data:
+                            state["last_viewed_doc_ids"] = [result_data["id"]]
+
                     _append_to_history(history, "user", f"Tool result: {json.dumps(res)}")
                     continue  # next loop iteration → send tool result back to LLM
 

@@ -103,6 +103,9 @@ class AgentHTTPRequestHandler(SimpleHTTPRequestHandler):
                 data = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
                 mode = data.get('mode', 'gmail')
                 agent_state.pop(f"history_{mode}", None)
+                # Clear docs state when leaving docs mode
+                if mode == "docs":
+                    agent_state.pop("last_viewed_doc_ids", None)
                 # Also clear any pending attachment state
                 agent_state.pop("last_image", None)
                 agent_state.pop("last_attachment_path", None)
