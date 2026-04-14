@@ -44,10 +44,10 @@ document.addEventListener("DOMContentLoaded", () => {
         },
         docs: {
             label:      "📄 Google Docs MCP",
-            placeholder:"Google Docs MCP coming soon...",
-            greeting:   "**Google Docs MCP** is coming soon!\n\nRead, edit, and create Google Docs through natural language — on the way.",
+            placeholder:"Ask G-Assistant to manage your Google Docs...",
+            greeting:   "Hello! I am your **Google Docs Assistant**.\n\nI can help you:\n• **List** your recent documents\n• **Search** docs by title or content\n• **Read** any document\n• **Create** new documents\n• **Append** text to existing docs\n• **Find & Replace** content\n• **Rename** or **Delete** documents\n\nJust tell me what you need!",
             showInbox:  false,
-            comingSoon: true
+            comingSoon: false
         },
         sheets: {
             label:      "📊 Google Sheets MCP",

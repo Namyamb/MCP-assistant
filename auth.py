@@ -3,7 +3,7 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from app.core.config import CREDENTIALS_FILE, GMAIL_SCOPES as SCOPES, TOKEN_FILE
+from app.core.config import CREDENTIALS_FILE, ALL_SCOPES as SCOPES, TOKEN_FILE
 from google_auth_oauthlib.flow import InstalledAppFlow
 
 if __name__ == "__main__":
