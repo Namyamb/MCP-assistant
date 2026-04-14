@@ -28,6 +28,7 @@ from app.core.config import MAX_TOOL_LOOPS, MAX_HISTORY_MSG_CHARS
 from app.core.llm_client import call_model                         # noqa: E402
 from app.integrations.gmail.registry import GMAIL_TOOLS           # noqa: E402
 from app.integrations.docs.registry import DOCS_TOOLS             # noqa: E402
+from app.integrations.sheets.registry import SHEETS_TOOLS         # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -937,9 +938,354 @@ def _docs_intent_detect(text: str, mcp, state: dict) -> Optional[str]:
     return None  # fall through to LLM
 
 
+_SHEETS_SYSTEM_PROMPT = """\
+You are G-Assistant operating in Google Sheets MCP mode.
+
+Context:
+- Date: {current_date}
+- Recent spreadsheet IDs: {viewed_sheet_ids}
+
+YOUR JOB: Convert the user's request into a single JSON tool call for Google Sheets.
+Output ONLY the JSON block — no text before or after it.
+
+```json
+{{"tool": "TOOL_NAME", "args": {{"key": "value"}}}}
+```
+
+INFORMATION EXTRACTION:
+- SPREADSHEET ID: Extract from URLs (string between /spreadsheets/d/ and /edit), or use recent IDs above.
+- RANGE: Use A1 notation like "Sheet1!A1:D10", "Sheet1!A:A", or just "Sheet1" for the whole sheet.
+- VALUES: Must be a 2-D JSON array — rows are inner arrays:
+    e.g. [["Name","Age"],["Alice",30]] for a 2-row, 2-column block.
+- CONTEXT REFERENCES: "it"/"that"/"the sheet" → use first ID from Recent spreadsheet IDs.
+
+AVAILABLE TOOLS:
+{tool_list}
+
+TOOL GUIDE:
+- list_sheets(limit)                              → list recent spreadsheets
+- search_sheets(query, limit)                     → full-text search across spreadsheets
+- get_sheet(sheet_id)                             → read spreadsheet metadata & tab names
+- read_sheet(sheet_id, range_name)                → read cell values from a range
+- create_sheet(title)                             → create a new spreadsheet
+- write_to_sheet(sheet_id, range_name, values)    → overwrite a range with 2-D values
+- append_to_sheet(sheet_id, range_name, values)   → append rows after existing data
+- clear_sheet_range(sheet_id, range_name)         → clear values in a range
+- add_sheet_tab(sheet_id, tab_name)               → add a new tab
+- rename_sheet_tab(sheet_id, old_name, new_name)  → rename a tab
+- delete_sheet(sheet_id)                          → move spreadsheet to trash
+
+RULES:
+1. ALWAYS attempt a tool call for any Sheets-related request. Never refuse.
+2. When the user says "write Name, Age header" → values = [["Name","Age"]].
+3. Only redirect for completely unrelated topics:
+   "I'm in **Google Sheets MCP** mode. Switch to **General Assistant** for non-Sheets questions."
+"""
+
+# Spreadsheet IDs share the same format as Doc IDs
+_SHEET_ID_RE = re.compile(r'[a-zA-Z0-9_-]{25,}')
+
+
+def _extract_sheet_id(text: str) -> Optional[str]:
+    url_m = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]{25,})', text)
+    if url_m:
+        return url_m.group(1)
+    m = _SHEET_ID_RE.search(text)
+    return m.group(0) if m else None
+
+
+def _fmt_sheets(res_data: dict) -> str:
+    """Render Sheets tool results as HTML."""
+    if not isinstance(res_data, dict) or "success" not in res_data:
+        return str(res_data)
+    if not res_data.get("success"):
+        return f"<b style='color:#ef4444'>Error:</b> {res_data.get('error', 'Unknown error')}"
+
+    res = res_data.get("result", "")
+
+    def _render_table(values: list) -> str:
+        if not values:
+            return "(empty)"
+        capped = values[:50]
+        rows_html = []
+        for i, row in enumerate(capped):
+            tag   = "th" if i == 0 else "td"
+            cells = "".join(
+                f"<{tag} style='padding:4px 8px;border:1px solid rgba(255,255,255,0.1);"
+                f"background:{'rgba(99,102,241,0.15)' if i==0 else 'transparent'}'>"
+                f"{str(c)}</{tag}>"
+                for c in row
+            )
+            rows_html.append(f"<tr>{cells}</tr>")
+        truncation = (
+            f"<tr><td colspan='99' style='color:var(--text-muted);font-size:12px;padding:4px 8px'>"
+            f"…{len(values)-50} more rows</td></tr>"
+        ) if len(values) > 50 else ""
+        return (
+            f"<div style='overflow-x:auto;margin-top:8px'>"
+            f"<table style='border-collapse:collapse;font-size:13px'>"
+            f"{''.join(rows_html)}{truncation}</table></div>"
+        )
+
+    def _render(data) -> str:
+        if isinstance(data, list):
+            # List of spreadsheet dicts (from list_sheets / search_sheets)
+            if data and isinstance(data[0], dict) and "id" in data[0] and "title" in data[0]:
+                items = []
+                for s in data:
+                    url   = s.get("url", "")
+                    title = s.get("title", "(Untitled)")
+                    mod   = s.get("modified", "")
+                    link  = f"<a href='{url}' target='_blank' style='color:var(--primary)'>{title}</a>" if url else f"<b>{title}</b>"
+                    items.append(
+                        f"<div style='padding:8px 10px;margin:5px 0;background:rgba(99,102,241,.08);"
+                        f"border-left:3px solid var(--primary);border-radius:4px'>"
+                        f"{link}<br>"
+                        f"<span style='color:var(--text-muted);font-size:12px'>ID: {s.get('id','')}"
+                        f"{' · ' + mod if mod else ''}</span></div>"
+                    )
+                return "".join(items)
+            # Raw 2-D values (from read_sheet result.values wrapped in list)
+            return _render_table(data)
+        if isinstance(data, dict):
+            # read_sheet result
+            if "values" in data:
+                header = (
+                    f"<b>Range:</b> {data.get('range','')}<br>"
+                    f"<span style='color:var(--text-muted);font-size:12px'>"
+                    f"{data.get('rows',0)} rows × {data.get('cols',0)} cols</span>"
+                )
+                return header + "<br>" + _render_table(data["values"])
+            # get_sheet metadata
+            if "tabs" in data:
+                url   = data.get("url", "")
+                title = data.get("title", "(Untitled)")
+                link  = f"<a href='{url}' target='_blank' style='color:var(--primary)'>{title}</a>" if url else f"<b>{title}</b>"
+                tabs_html = "".join(
+                    f"<span style='display:inline-block;margin:2px 4px;padding:2px 8px;"
+                    f"background:rgba(99,102,241,0.15);border-radius:4px;font-size:12px'>"
+                    f"{t['name']} ({t['rows']}×{t['cols']})</span>"
+                    for t in data["tabs"]
+                )
+                return (
+                    f"<b>Spreadsheet:</b> {link}<br>"
+                    f"<span style='color:var(--text-muted);font-size:12px'>ID: {data.get('id','')}</span><br>"
+                    f"<b>Tabs:</b> {tabs_html}"
+                )
+            # Generic dict (create/write/append results)
+            lines = [f"<b>{k.replace('_',' ').capitalize()}:</b> {_render(v)}"
+                     for k, v in data.items() if v not in (None, "", [], {})]
+            return "<br>".join(lines)
+        return str(data).replace("\n", "<br>")
+
+    if isinstance(res, str):
+        return res.replace("\n", "<br>")
+    return _render(res)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Google Sheets intent router  (zero-latency fast path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _sheets_intent_detect(text: str, mcp, state: dict) -> Optional[str]:
+    """Return an HTML reply string, or None to fall through to the LLM."""
+    low  = text.lower().strip()
+    sids = state.get("last_viewed_sheet_ids", [])
+
+    # ── Greetings ────────────────────────────────────────────────────────────
+    if re.match(r'^(hi+|hello+|hey+|howdy|greetings?)[\s!?.]*$', low):
+        return (
+            "👋 <b>Hi! I'm G-Assistant in Google Sheets mode.</b><br><br>"
+            "Here's what I can do:<br>"
+            "• <b>List</b> your recent spreadsheets<br>"
+            "• <b>Search</b> sheets by title or content<br>"
+            "• <b>Read</b> any sheet or cell range<br>"
+            "• <b>Create</b> a new spreadsheet<br>"
+            "• <b>Write / Append</b> data to a sheet<br>"
+            "• <b>Clear</b> a range<br>"
+            "• <b>Add / Rename</b> tabs<br>"
+            "• <b>Delete</b> a spreadsheet<br><br>"
+            "Just tell me what you need!"
+        )
+
+    # ── List sheets ───────────────────────────────────────────────────────────
+    if re.search(
+        r'\b(?:list|show|get|fetch|display|see|view)\s+(?:my\s+|all\s+|recent\s+)?'
+        r'(?:google\s+)?(?:sheets?|spreadsheets?)\b', low
+    ) or low in {"sheets", "spreadsheets", "my sheets", "recent sheets"}:
+        res = mcp.execute_tool("list_sheets", {"limit": 10})
+        ids = [s["id"] for s in (res.get("result") or []) if isinstance(s, dict)]
+        state["last_viewed_sheet_ids"] = ids
+        return f"Your recent spreadsheets:<br><br>{_fmt_sheets(res)}"
+
+    # ── Search sheets ─────────────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:search|find|look\s+for)\s+(?:(?:google\s+)?sheets?\s+|spreadsheets?\s+)?'
+        r'(?:about|for|with|containing|titled?|named?|regarding)?\s+["\']?(.+?)["\']?\s*$', low
+    )
+    if m:
+        q = m.group(1).strip()
+        if len(q) > 1 and q not in ("sheet", "sheets", "spreadsheet", "spreadsheets"):
+            res = mcp.execute_tool("search_sheets", {"query": q, "limit": 10})
+            ids = [s["id"] for s in (res.get("result") or []) if isinstance(s, dict)]
+            state["last_viewed_sheet_ids"] = ids
+            return f"Search results for <b>{q}</b>:<br><br>{_fmt_sheets(res)}"
+
+    # ── Open / get sheet metadata ─────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:open|show|get|view|info(?:rmation)?|details?|metadata)\s+'
+        r'(?:sheet\s+|spreadsheet\s+)?([a-zA-Z0-9_-]{25,})\b', text
+    )
+    if not m:
+        m = re.search(r'/spreadsheets/d/([a-zA-Z0-9_-]{25,})', text)
+    if m:
+        sid = m.group(1)
+        res = mcp.execute_tool("get_sheet", {"sheet_id": sid})
+        state["last_viewed_sheet_ids"] = [sid]
+        return f"Spreadsheet details:<br><br>{_fmt_sheets(res)}"
+
+    # ── Read a range ──────────────────────────────────────────────────────────
+    m = re.search(
+        r'\bread\s+(?:sheet\s+)?([a-zA-Z0-9_-]{25,})'
+        r'(?:\s+(?:range|tab|sheet)?)?\s+([A-Za-z][A-Za-z0-9!:$]+)', text
+    )
+    if m:
+        sid        = m.group(1)
+        range_name = m.group(2)
+        res = mcp.execute_tool("read_sheet", {"sheet_id": sid, "range_name": range_name})
+        state["last_viewed_sheet_ids"] = [sid]
+        return f"Sheet data (<b>{range_name}</b>):<br><br>{_fmt_sheets(res)}"
+
+    # ── Read whole sheet ──────────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:read|show|display|fetch)\s+(?:sheet\s+|spreadsheet\s+)?([a-zA-Z0-9_-]{25,})\s*$', text
+    )
+    if m:
+        sid = m.group(1)
+        res = mcp.execute_tool("read_sheet", {"sheet_id": sid, "range_name": "Sheet1"})
+        state["last_viewed_sheet_ids"] = [sid]
+        return f"Sheet data:<br><br>{_fmt_sheets(res)}"
+
+    # ── Write column headers to last/specified sheet ──────────────────────────
+    # Catches: "put/add/write column names id,name,email"
+    if re.search(r'\b(?:put|add|write|set|insert)\s+(?:the\s+)?column\s+(?:names?|headers?)\b', low):
+        col_m = re.search(
+            r'(?:column\s+(?:names?|headers?)\s+(?:as\s+)?|columns?\s*[=:]\s*)'
+            r'([a-zA-Z_][a-zA-Z0-9_ ]*(?:[,/|]\s*[a-zA-Z_][a-zA-Z0-9_ ]*)+)', low
+        )
+        if not col_m:
+            # "as id, name, email" anywhere in message
+            col_m = re.search(r'\bas\s+([a-zA-Z_][a-zA-Z0-9_ ]*(?:[,/|]\s*[a-zA-Z_][a-zA-Z0-9_ ]*)+)', low)
+        sid = _extract_sheet_id(text) or (sids[0] if sids else None)
+        if sid and col_m:
+            columns = [c.strip() for c in re.split(r'[,/|]', col_m.group(1)) if c.strip()]
+            res = mcp.execute_tool("write_to_sheet", {
+                "sheet_id": sid, "range_name": "Sheet1!A1", "values": [columns]
+            })
+            state["last_viewed_sheet_ids"] = [sid]
+            return f"✅ Headers <b>{', '.join(columns)}</b> written to the spreadsheet!<br><br>{_fmt_sheets(res)}"
+        if sid and not col_m:
+            return (
+                "Please tell me the column names, e.g.<br>"
+                "<b>add column headers: id, name, email</b>"
+            )
+
+    # ── Create a new spreadsheet (smart title + optional column headers) ──────
+    if re.search(r'\b(?:create|make|new)\s+(?:a\s+)?(?:new\s+)?(?:google\s+)?(?:sheet|spreadsheet)\b', low):
+        # --- extract title ---
+        title = None
+        # "name this sheet as X" / "name it X" / "call it X"
+        t_m = re.search(
+            r'(?:name|call|title)\s+(?:this\s+)?(?:sheet|spreadsheet|it)\s+(?:as\s+)?["\']?([^"\']+?)["\']?'
+            r'\s*(?:$|with\b|and\b|,)',
+            low
+        )
+        if t_m:
+            title = t_m.group(1).strip().title()
+        if not title:
+            # "called X" / "named X"
+            t_m = re.search(r'(?:called|named|titled?)\s+["\']?([^"\']+?)["\']?\s*(?:$|with\b|and\b|,)', low)
+            if t_m:
+                title = t_m.group(1).strip().title()
+        if not title:
+            title = "Untitled Sheet"
+
+        # --- extract column names ---
+        columns = []
+        col_m = re.search(
+            r'column\s+(?:names?|headers?)\s+(?:as\s+)?([a-zA-Z_][a-zA-Z0-9_ ]*(?:[,/|]\s*[a-zA-Z_][a-zA-Z0-9_ ]*)+)',
+            low
+        )
+        if col_m:
+            columns = [c.strip() for c in re.split(r'[,/|]', col_m.group(1)) if c.strip()]
+
+        # --- create the sheet ---
+        res      = mcp.execute_tool("create_sheet", {"title": title})
+        result   = res.get("result") if isinstance(res, dict) else {}
+        sheet_id = result.get("id", "") if isinstance(result, dict) else ""
+        if sheet_id:
+            state["last_viewed_sheet_ids"] = [sheet_id]
+
+        # --- write headers if columns were specified ---
+        if columns and sheet_id:
+            mcp.execute_tool("write_to_sheet", {
+                "sheet_id": sheet_id,
+                "range_name": "Sheet1!A1",
+                "values": [columns]
+            })
+            return (
+                f"📊 Spreadsheet <b>{title}</b> created with headers "
+                f"<b>{', '.join(columns)}</b>!<br><br>{_fmt_sheets(res)}"
+            )
+
+        return f"📊 Spreadsheet <b>{title}</b> created!<br><br>{_fmt_sheets(res)}"
+
+    # ── Add a tab ─────────────────────────────────────────────────────────────
+    m = re.search(
+        r'\badd\s+(?:a\s+)?(?:tab|sheet)\s+(?:called|named)?\s*["\']?([^"\']+?)["\']?'
+        r'\s+(?:to|in)\s+([a-zA-Z0-9_-]{25,})', low
+    )
+    if m:
+        tab_name = m.group(1).strip()
+        sid      = m.group(2)
+        res = mcp.execute_tool("add_sheet_tab", {"sheet_id": sid, "tab_name": tab_name})
+        return f"✅ Tab <b>{tab_name}</b> added!<br><br>{_fmt_sheets(res)}"
+
+    # ── Clear a range ─────────────────────────────────────────────────────────
+    m = re.search(
+        r'\bclear\s+(?:range\s+)?([A-Za-z][A-Za-z0-9!:$]+)\s+'
+        r'(?:in|from|of)\s+([a-zA-Z0-9_-]{25,})', text
+    )
+    if not m:
+        m = re.search(
+            r'\bclear\s+([a-zA-Z0-9_-]{25,})\s+([A-Za-z][A-Za-z0-9!:$]+)', text
+        )
+    if m:
+        range_name = m.group(1) if re.match(r'[A-Za-z]', m.group(1)) else m.group(2)
+        sid        = m.group(2) if re.match(r'[A-Za-z]', m.group(1)) else m.group(1)
+        res = mcp.execute_tool("clear_sheet_range", {"sheet_id": sid, "range_name": range_name})
+        return f"🧹 Range cleared!<br><br>{_fmt_sheets(res)}"
+
+    # ── Delete / trash a spreadsheet ──────────────────────────────────────────
+    m = re.search(
+        r'\b(?:delete|trash|remove)\s+(?:sheet\s+|spreadsheet\s+)?([a-zA-Z0-9_-]{25,})\b', text
+    )
+    if m:
+        sid = m.group(1)
+        res = mcp.execute_tool("delete_sheet", {"sheet_id": sid})
+        return f"🗑️ Spreadsheet moved to trash.<br><br>{_fmt_sheets(res)}"
+
+    # ── Contextual: open last sheet ───────────────────────────────────────────
+    if re.search(r'\b(?:open|read|show)\s+(?:it|that|this|the\s+(?:last|same)\s+one)\b', low):
+        if sids:
+            res = mcp.execute_tool("get_sheet", {"sheet_id": sids[0]})
+            return f"Spreadsheet details:<br><br>{_fmt_sheets(res)}"
+
+    return None  # fall through to LLM
+
+
 _MODE_NAMES: dict[str, str] = {
-    "drive":  "Google Drive MCP",
-    "sheets": "Google Sheets MCP",
+    "drive": "Google Drive MCP",
 }
 
 
@@ -989,6 +1335,11 @@ def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
         if intent_reply is not None:
             return intent_reply
 
+    if mode == "sheets" and not attachment:
+        intent_reply = _sheets_intent_detect(user_input, mcp, state)
+        if intent_reply is not None:
+            return intent_reply
+
     # ── Build mode-specific system prompt ────────────────────────────────────
     if mode == "gmail":
         tool_list  = "\n".join(f"- {k}" for k in GMAIL_TOOLS)
@@ -1007,6 +1358,14 @@ def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
         sys_prompt = _DOCS_SYSTEM_PROMPT.format(
             current_date=now_str,
             viewed_doc_ids=", ".join(d_ids) if d_ids else "None",
+            tool_list=tool_list,
+        )
+    elif mode == "sheets":
+        tool_list  = "\n".join(f"- {k}" for k in SHEETS_TOOLS)
+        s_ids      = state.get("last_viewed_sheet_ids", [])
+        sys_prompt = _SHEETS_SYSTEM_PROMPT.format(
+            current_date=now_str,
+            viewed_sheet_ids=", ".join(s_ids) if s_ids else "None",
             tool_list=tool_list,
         )
     elif mode == "general":
@@ -1065,8 +1424,8 @@ def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
             _append_to_history(history, "assistant",
                                content if isinstance(content, str) else json.dumps(content))
 
-            # Tool execution (Gmail and Docs modes)
-            if mode in ("gmail", "docs") and isinstance(content, str):
+            # Tool execution (Gmail, Docs, Sheets modes)
+            if mode in ("gmail", "docs", "sheets") and isinstance(content, str):
                 tool_call = _parse_tool_call(content)
                 if tool_call:
                     tool_name = tool_call["tool"]
@@ -1094,6 +1453,16 @@ def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
                                 state["last_viewed_doc_ids"] = ids
                         elif isinstance(result_data, dict) and "id" in result_data:
                             state["last_viewed_doc_ids"] = [result_data["id"]]
+
+                    # Sheets-specific: cache last viewed sheet IDs
+                    if mode == "sheets" and isinstance(res, dict):
+                        result_data = res.get("result")
+                        if isinstance(result_data, list):
+                            ids = [s["id"] for s in result_data if isinstance(s, dict) and "id" in s]
+                            if ids:
+                                state["last_viewed_sheet_ids"] = ids
+                        elif isinstance(result_data, dict) and "id" in result_data:
+                            state["last_viewed_sheet_ids"] = [result_data["id"]]
 
                     _append_to_history(history, "user", f"Tool result: {json.dumps(res)}")
                     continue  # next loop iteration → send tool result back to LLM
