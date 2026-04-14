@@ -51,10 +51,10 @@ document.addEventListener("DOMContentLoaded", () => {
         },
         sheets: {
             label:      "📊 Google Sheets MCP",
-            placeholder:"Google Sheets MCP coming soon...",
-            greeting:   "**Google Sheets MCP** is coming soon!\n\nQuery and update your spreadsheets via chat — launching soon.",
+            placeholder:"Ask G-Assistant to manage your spreadsheets...",
+            greeting:   "Hello! I am your **Google Sheets Assistant**.\n\nI can help you:\n• **List** your recent spreadsheets\n• **Search** sheets by title or content\n• **Read** any sheet or cell range\n• **Create** new spreadsheets\n• **Write / Append** data to sheets\n• **Clear** ranges\n• **Add / Rename** tabs\n• **Delete** spreadsheets\n\nJust tell me what you need!",
             showInbox:  false,
-            comingSoon: true
+            comingSoon: false
         }
     };
 

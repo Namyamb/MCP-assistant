@@ -6,6 +6,7 @@ from app.tools.calculator import evaluate_expression as calculator
 from app.tools.filesystem import read_file, list_files
 from app.integrations.gmail.registry import GMAIL_TOOLS
 from app.integrations.docs.registry import DOCS_TOOLS
+from app.integrations.sheets.registry import SHEETS_TOOLS
 from app.ui.web import run_web
 from app.ui.desktop import run_desktop
 
@@ -36,6 +37,8 @@ def build_server():
     for name, func in GMAIL_TOOLS.items():
         mcp.register_tool(name, func)
     for name, func in DOCS_TOOLS.items():
+        mcp.register_tool(name, func)
+    for name, func in SHEETS_TOOLS.items():
         mcp.register_tool(name, func)
     _ensure_scheduler_running()
     _cached_mcp = mcp

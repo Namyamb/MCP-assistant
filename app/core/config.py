@@ -34,9 +34,10 @@ MAX_TOOL_LOOPS = int(os.getenv("MAX_TOOL_LOOPS", "3"))
 MAX_HISTORY_MSG_CHARS = int(os.getenv("MAX_HISTORY_MSG_CHARS", "1500"))
 WEB_HOST = os.getenv("WEB_HOST", "127.0.0.1")
 WEB_PORT = int(os.getenv("WEB_PORT", "8000"))
-GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
-DOCS_SCOPES  = [
+GMAIL_SCOPES  = ["https://www.googleapis.com/auth/gmail.modify"]
+DOCS_SCOPES   = [
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/drive",
 ]
-ALL_SCOPES = GMAIL_SCOPES + DOCS_SCOPES
+SHEETS_SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+ALL_SCOPES    = GMAIL_SCOPES + DOCS_SCOPES + SHEETS_SCOPES
