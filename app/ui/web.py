@@ -108,6 +108,8 @@ class AgentHTTPRequestHandler(SimpleHTTPRequestHandler):
                     agent_state.pop("last_viewed_doc_ids", None)
                 if mode == "sheets":
                     agent_state.pop("last_viewed_sheet_ids", None)
+                if mode == "drive":
+                    agent_state.pop("last_viewed_drive_ids", None)
                 # Also clear any pending attachment state
                 agent_state.pop("last_image", None)
                 agent_state.pop("last_attachment_path", None)

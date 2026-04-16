@@ -37,10 +37,10 @@ document.addEventListener("DOMContentLoaded", () => {
         },
         drive: {
             label:      "📁 Drive MCP",
-            placeholder:"Google Drive MCP coming soon...",
-            greeting:   "**Google Drive MCP** is coming soon!\n\nYou'll be able to browse, search, upload, and manage your Drive files directly from this chat. Stay tuned!",
+            placeholder:"Ask G-Assistant to manage your Google Drive...",
+            greeting:   "Hello! I am your **Google Drive Assistant**.\n\nI can help you:\n• **Browse** files, folders, recent & starred items\n• **Search** by name, content, or file type (docs, sheets, PDFs, images…)\n• **Upload** — attach any file with 📎, then say where to put it (e.g. *upload to nnn folder*)\n• **Create** folders\n• **Organise** — move, rename, copy files\n• **Trash / restore / delete** files\n• **Share** files and manage permissions\n• **Get shareable links** or make files private\n• **Check storage** usage and quota\n\nJust tell me what you need!",
             showInbox:  false,
-            comingSoon: true
+            comingSoon: false
         },
         docs: {
             label:      "📄 Google Docs MCP",

@@ -27,7 +27,7 @@ for d in [DATA_DIR, DOWNLOADS_DIR, UPLOADS_DIR, CREDENTIALS_DIR]:
 LM_STUDIO_URL = os.getenv("LM_STUDIO_URL", "http://127.0.0.1:1234/v1/chat/completions")
 MODEL_NAME = os.getenv("MODEL_NAME", "gemma-4-e2b-it")
 LLM_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "120"))
-LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.2"))
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.6"))
 AGENT_NAME = os.getenv("AGENT_NAME", "G-Assistant")
 CONTEXT_WINDOW = int(os.getenv("CONTEXT_WINDOW", "30"))
 MAX_TOOL_LOOPS = int(os.getenv("MAX_TOOL_LOOPS", "3"))
