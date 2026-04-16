@@ -29,6 +29,7 @@ from app.core.llm_client import call_model                         # noqa: E402
 from app.integrations.gmail.registry import GMAIL_TOOLS           # noqa: E402
 from app.integrations.docs.registry import DOCS_TOOLS             # noqa: E402
 from app.integrations.sheets.registry import SHEETS_TOOLS         # noqa: E402
+from app.integrations.drive.registry import DRIVE_TOOLS           # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +120,14 @@ def _is_real_recipient(word: str) -> bool:
 
 def _intent_detect(text: str, mcp, state: dict) -> Optional[str]:
     """Return an HTML reply string, or None to fall through to the LLM."""
-    low = text.lower().strip()
+    # ── Semantic enrichment: resolve references before regex matching ─────────
+    text = _resolve_refs(text, state)
+    low  = text.lower().strip()
+
+    # ── Slot-filling: advance any in-progress multi-turn action ───────────────
+    slot_reply = _check_pending_action(text, state, mcp)
+    if slot_reply is not None:
+        return slot_reply
 
     # ── Greetings ────────────────────────────────────────────────────────────
     if re.match(r'^(hi+|hello+|hey+|howdy|greetings?|good\s*(morning|afternoon|evening))[\s!?.]*$', low):
@@ -171,7 +179,7 @@ def _intent_detect(text: str, mcp, state: dict) -> Optional[str]:
         r'(?:latest|last|most\s+recent|newest|first|top|recent)\s+(?:email|mail|message)\b', low
     ):
         res = mcp.execute_tool("get_emails", {"limit": 1})
-        state["last_viewed_ids"] = _ids_from(res)
+        state["last_viewed_ids"] = _register_entities(state, "get_emails", res)
         return f"Here is your latest email:<br><br>{_fmt(res)}"
 
     # ── Read inbox ───────────────────────────────────────────────────────────
@@ -184,20 +192,20 @@ def _intent_detect(text: str, mcp, state: dict) -> Optional[str]:
         or low in {"emails", "inbox", "mail", "messages"}
     ):
         res = mcp.execute_tool("get_emails", {"limit": 10})
-        state["last_viewed_ids"] = _ids_from(res)
+        state["last_viewed_ids"] = _register_entities(state, "get_emails", res)
         return f"Here are your latest emails:<br><br>{_fmt(res)}"
 
     # ── Unread ───────────────────────────────────────────────────────────────
     if re.search(r'\b(?:unread|unseen)\s*(?:emails?|mails?|messages?)?\b', low) \
        or re.search(r'\bemails?\s+(?:i\s+)?(?:haven\'t\s+read|not\s+read)\b', low):
         res = mcp.execute_tool("get_unread_emails", {})
-        state["last_viewed_ids"] = _ids_from(res)
+        state["last_viewed_ids"] = _register_entities(state, "get_emails", res)
         return f"Your unread emails:<br><br>{_fmt(res)}"
 
     # ── Starred ──────────────────────────────────────────────────────────────
     if re.search(r'\b(?:starred|important|flagged)\s*(?:emails?|mails?|messages?)?\b', low):
         res = mcp.execute_tool("get_starred_emails", {})
-        state["last_viewed_ids"] = _ids_from(res)
+        state["last_viewed_ids"] = _register_entities(state, "get_emails", res)
         return f"Your starred emails:<br><br>{_fmt(res)}"
 
     # ── Last week ────────────────────────────────────────────────────────────
@@ -206,14 +214,14 @@ def _intent_detect(text: str, mcp, state: dict) -> Optional[str]:
         start = (today - datetime.timedelta(days=7)).strftime("%Y/%m/%d")
         end   = today.strftime("%Y/%m/%d")
         res = mcp.execute_tool("get_emails_by_date_range", {"start": start, "end": end})
-        state["last_viewed_ids"] = _ids_from(res)
+        state["last_viewed_ids"] = _register_entities(state, "get_emails", res)
         return f"Emails from the last week:<br><br>{_fmt(res)}"
 
     # ── Today ────────────────────────────────────────────────────────────────
     if re.search(r'\btoday\b', low) and re.search(r'\b(?:email|mail|message)\b', low):
         today = datetime.datetime.utcnow().strftime("%Y/%m/%d")
         res = mcp.execute_tool("search_emails", {"query": f"after:{today}", "limit": 10})
-        state["last_viewed_ids"] = _ids_from(res)
+        state["last_viewed_ids"] = _register_entities(state, "get_emails", res)
         return f"Emails from today:<br><br>{_fmt(res)}"
 
     # ── Bulk delete ──────────────────────────────────────────────────────────
@@ -358,14 +366,14 @@ def _intent_detect(text: str, mcp, state: dict) -> Optional[str]:
     email_in_text = _extract_email(text)
     if email_in_text and re.search(r'\b(?:from|by|emails?\s+from|messages?\s+from)\b', low):
         res = mcp.execute_tool("search_emails", {"query": f"from:{email_in_text}", "limit": 10})
-        state["last_viewed_ids"] = _ids_from(res)
+        state["last_viewed_ids"] = _register_entities(state, "get_emails", res)
         return f"Emails from <b>{email_in_text}</b>:<br><br>{_fmt(res)}"
 
     m = re.search(r'\b(?:emails?\s+from|messages?\s+from|from)\s+([^\s,?!.]+)', low)
     if m and _is_real_recipient(m.group(1)):
         sender = m.group(1)
         res = mcp.execute_tool("search_emails", {"query": f"from:{sender}", "limit": 10})
-        state["last_viewed_ids"] = _ids_from(res)
+        state["last_viewed_ids"] = _register_entities(state, "get_emails", res)
         return f"Emails from <b>{sender}</b>:<br><br>{_fmt(res)}"
 
     # ── Search by keyword / subject ──────────────────────────────────────────
@@ -377,7 +385,7 @@ def _intent_detect(text: str, mcp, state: dict) -> Optional[str]:
         q = m.group(1).strip().strip('"\'')
         if len(q) > 2:
             res = mcp.execute_tool("search_emails", {"query": q, "limit": 10})
-            state["last_viewed_ids"] = _ids_from(res)
+            state["last_viewed_ids"] = _register_entities(state, "get_emails", res)
             return f"Search results for <b>{q}</b>:<br><br>{_fmt(res)}"
 
     # ── Compose / Send / Draft ───────────────────────────────────────────────
@@ -417,6 +425,7 @@ def _intent_detect(text: str, mcp, state: dict) -> Optional[str]:
                 state.update(last_draft_id=did, last_to=to, last_body=body, last_subject=subject)
             return f"📝 Draft created to <b>{to}</b>!<br>Draft ID: <code>{did}</code><br>Say <b>'send it'</b> to send."
         res = mcp.execute_tool("send_email", args)
+        state.update(last_to=to, last_body=body, last_subject=subject)
         return f"✅ Email sent to <b>{to}</b>!<br><br>{_fmt(res)}"
 
     # ── Draft (extended — handles "create a draft for [mail/email] to X ...") ─
@@ -448,6 +457,7 @@ def _intent_detect(text: str, mcp, state: dict) -> Optional[str]:
         action_m = re.search(r'\b(send)\b', low)
         if action_m and action_m.group(1) == "send":
             res = mcp.execute_tool("send_email", args)
+            state.update(last_to=to, last_body=body, last_subject=subject)
             return f"✅ Email sent to <b>{to}</b>!<br><br>{_fmt(res)}"
         res      = mcp.execute_tool("draft_email", args)
         result   = res.get("result", {}) if isinstance(res, dict) else {}
@@ -474,6 +484,33 @@ def _intent_detect(text: str, mcp, state: dict) -> Optional[str]:
         state.update(last_draft_id=draft_id, last_to=to, last_body=body, last_subject=subject)
         return f"✅ Draft created to <b>{to}</b>!<br>Draft ID: <code>{draft_id}</code><br>Say <b>'send it'</b> to dispatch."
 
+    # ── Send again / resend / send to same ──────────────────────────────────
+    # Catches: "send again", "resend", "send to same email id", "send same again"
+    # Optionally accepts new subject / body in the same message.
+    if re.search(
+        r'\b(?:send\s+again|resend|send\s+same|same\s+again|'
+        r'send\s+to\s+(?:the\s+)?same(?:\s+email(?:\s+id)?)?)\b', low
+    ):
+        to   = state.get("last_to")
+        subj = state.get("last_subject", "Message")
+        body = state.get("last_body", "Hello!")
+        if to:
+            # Allow overriding subject inline: "send again subject as Hi"
+            subj_m = re.search(r'\bsubject\s+(?:as\s+|:?\s*)([^\s,]+(?:\s+\w+)*?)(?:\s+(?:and|body)|$)', low)
+            # Allow overriding body inline (everything after "body" keyword or "saying")
+            body_m = re.search(r'\b(?:body|saying|with\s+body)\s+(?:as\s+)?(.+)', low, re.DOTALL)
+            if subj_m:
+                subj = subj_m.group(1).strip()
+            if body_m:
+                body = body_m.group(1).strip()
+            args = {"to": to, "subject": subj, "body": body}
+            if state.get("last_attachment_path"):
+                args["attachment_path"] = state.pop("last_attachment_path")
+            res = mcp.execute_tool("send_email", args)
+            state.update(last_to=to, last_body=body, last_subject=subj)
+            return f"✅ Email sent again to <b>{to}</b>!<br><br>{_fmt(res)}"
+        return "I don't have a previous recipient saved. Please say <b>send email to [address] saying [message]</b>."
+
     # ── Send queued draft ────────────────────────────────────────────────────
     if re.search(
         r'^\s*(?:send|send\s+it|send\s+that|send\s+the\s+(?:draft|mail|email))\s*$', low
@@ -491,8 +528,9 @@ def _intent_detect(text: str, mcp, state: dict) -> Optional[str]:
             if state.get("last_attachment_path"):
                 args["attachment_path"] = state.pop("last_attachment_path")
             res = mcp.execute_tool("send_email", args)
+            state.update(last_to=to, last_body=body, last_subject=subj)
             return f"✅ Email sent to <b>{to}</b>!<br><br>{_fmt(res)}"
-        return "I don't have a draft queued. Say <b>send email to [address] saying [message]</b>."
+        return "I don't have a previous email to send. Say <b>send email to [address] saying [message]</b>."
 
     # ── Discard draft ────────────────────────────────────────────────────────
     if re.search(
@@ -538,6 +576,56 @@ def _intent_detect(text: str, mcp, state: dict) -> Optional[str]:
             )
         # No previous recipient — let LLM handle it (it will ask for clarification)
 
+    # ── Update / rewrite draft content ───────────────────────────────────────
+    # "write proper content for that" / "rewrite the body" / "improve the draft"
+    if re.search(
+        r'\b(?:write|rewrite|update|improve|fix|redo|rephrase|polish|make\s+(?:it\s+)?(?:proper|better|formal|professional))'
+        r'(?:\s+(?:the|its?|that|this))?\s*(?:content|body|mail|email|draft|message|text)?\s*(?:for\s+(?:that|it|this|the\s+draft))?\b',
+        low
+    ) or re.search(
+        r'\b(?:content|body)\s+(?:in\s+)?(?:proper|better|formal|professional)\s+way\b', low
+    ):
+        draft_id = state.get("last_draft_id")
+        if draft_id:
+            return None  # Let LLM handle with full context (it has last_draft_id, last_to, last_subject)
+
+    # ── Email intent without recipient → start slot-filling ──────────────────
+    # Catches: "write an email saying X" / "compose an email" with no address
+    if re.search(r'\b(?:write|send|compose|draft|make|create)\s+(?:an?\s+)?(?:email|mail|message)\b', low) \
+            and not _extract_email(text) \
+            and not re.search(r'\bto\s+[\w.@+\-]{4,}', low):
+        _hint    = re.search(r'\bsaying\s+(.+?)(?:\s*[?.!]\s*$|$)', low, re.DOTALL)
+        action_m = re.search(r'\b(create|write|compose|draft|make|send)\b', low)
+        action   = action_m.group(1) if action_m else "send"
+        atype    = "draft_email" if action in ("create", "write", "compose", "draft", "make") else "send_email"
+        state["pending_action"] = {
+            "type": atype,
+            "to":   None,
+            "body": _hint.group(1).strip() if _hint else None,
+        }
+        return (
+            "I'd love to write that email! 📧<br><br>"
+            "Who should I send it to? Please share the <b>recipient's email address</b>."
+        )
+
+    # ── Reply intent without body → start slot-filling ────────────────────────
+    if re.search(r'\breply\b', low) \
+            and not re.search(r'\b[a-fA-F0-9]{10,}\b', low) \
+            and not re.search(r'\b(?:saying|with|body)\b', low):
+        ids = state.get("last_viewed_ids", [])
+        if ids:
+            state["pending_action"] = {"type": "reply_email", "message_id": ids[0], "body": None}
+            return "What would you like to say in the reply?"
+
+    # ── Forward intent without recipient → start slot-filling ─────────────────
+    if re.search(r'\bforward\b', low) \
+            and not re.search(r'\bto\s+[\w.@+\-]{4,}', low) \
+            and not re.search(r'\b[a-fA-F0-9]{10,}\b', low):
+        ids = state.get("last_viewed_ids", [])
+        if ids:
+            state["pending_action"] = {"type": "forward_email", "message_id": ids[0], "to": None}
+            return "Who should I forward it to? Please share the recipient's email address."
+
     return None  # fall through to LLM
 
 
@@ -550,16 +638,156 @@ def _ids_from(res: dict) -> list[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Entity registry — semantic metadata store
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ENTITY_REGISTRY_MAX = 30  # keep last N entities
+
+
+def _register_entities(state: dict, tool_name: str, res: dict) -> list[str]:
+    """
+    Extract IDs **and** semantic metadata (sender, subject, title, etc.) from a
+    tool result, persist them in state["entity_registry"], and return the IDs.
+
+    This replaces bare `_ids_from(res)` calls so that every fetched item gets a
+    semantic description the LLM and reference-resolver can use.
+    """
+    if not isinstance(res, dict):
+        return []
+
+    registry: dict = state.setdefault("entity_registry", {})
+    result = res.get("result", res)
+    ids: list[str] = []
+
+    def _register(item: dict) -> None:
+        eid = item.get("id", "")
+        if not eid:
+            return
+        ids.append(eid)
+        # ── Email ─────────────────────────────────────────────────────────────
+        if "subject" in item or "from" in item:
+            from_raw  = item.get("from", "")
+            # "First Last <addr@domain>" → "First Last"
+            from_name = from_raw.split("<")[0].strip() if "<" in from_raw else from_raw.split("@")[0]
+            registry[eid] = {
+                "type":      "email",
+                "from":      from_raw,
+                "from_name": from_name or from_raw,
+                "subject":   item.get("subject", "(no subject)"),
+                "date":      item.get("date", ""),
+                "snippet":   (item.get("snippet", "") or "")[:80],
+            }
+        # ── Drive file/folder (has "mime" or "type" field from _normalize_file) ─
+        elif "mime" in item or (
+            "type" in item and item.get("type") in (
+                "Folder", "Google Doc", "Google Sheet", "Google Slides",
+                "PDF", "PNG Image", "JPEG Image", "Text File", "CSV File",
+                "ZIP Archive", "File",
+            )
+        ):
+            registry[eid] = {
+                "type":      "drive",
+                "name":      item.get("name", "(untitled)"),
+                "file_type": item.get("type", "File"),
+                "url":       item.get("url", ""),
+            }
+        # ── Doc ───────────────────────────────────────────────────────────────
+        elif "doc" in tool_name.lower() or "title" in item:
+            registry[eid] = {
+                "type": "doc",
+                "name": item.get("name") or item.get("title", "(untitled)"),
+                "url":  item.get("webViewLink", ""),
+            }
+        # ── Sheet ─────────────────────────────────────────────────────────────
+        elif "sheet" in tool_name.lower():
+            registry[eid] = {
+                "type": "sheet",
+                "name": item.get("name") or item.get("title", "(untitled)"),
+            }
+
+    if isinstance(result, list):
+        for item in result:
+            if isinstance(item, dict):
+                _register(item)
+    elif isinstance(result, dict):
+        _register(result)
+
+    # Trim to most recent N entities
+    if len(registry) > _ENTITY_REGISTRY_MAX:
+        for old_key in list(registry.keys())[:-_ENTITY_REGISTRY_MAX]:
+            del registry[old_key]
+
+    return ids
+
+
+def _entity_context_str(state: dict) -> str:
+    """
+    Format the entity registry as a readable block for injection into system
+    prompts.  Shows the 15 most recently registered entities.
+    """
+    registry: dict = state.get("entity_registry", {})
+    if not registry:
+        return "None"
+
+    lines = []
+    for eid, meta in list(registry.items())[-15:]:
+        etype = meta.get("type", "item")
+        if etype == "email":
+            from_name = meta.get("from_name", "?")
+            subject   = meta.get("subject", "(no subject)")
+            date_part = f" | {meta['date']}" if meta.get("date") else ""
+            lines.append(f"  {eid}: email from \"{from_name}\" | \"{subject}\"{date_part}")
+        elif etype in ("doc", "sheet"):
+            lines.append(f"  {eid}: {etype} | \"{meta.get('name', '(untitled)')}\"")
+        elif etype == "drive":
+            ftype = meta.get("file_type", "File")
+            lines.append(f"  {eid}: {ftype} | \"{meta.get('name', '(untitled)')}\"")
+        else:
+            lines.append(f"  {eid}: {etype}")
+
+    return "\n".join(lines) if lines else "None"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LLM tool-call extraction
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse_tool_call(content: str) -> Optional[dict]:
-    """Extract a JSON tool-call block from the LLM response, or return None."""
-    # Prefer fenced ```json … ``` blocks
+    """
+    Extract a tool-call from the LLM response.  Handles three formats:
+
+    1. Standard JSON (as prompted):
+       {"tool": "send_email", "args": {"to": "...", "subject": "...", "body": "..."}}
+
+    2. Fenced JSON block:
+       ```json
+       {"tool": "send_email", "args": {...}}
+       ```
+
+    3. Model-native function-call format (Gemma/LLaMA-style):
+       <|tool_call>call:send_email{to:<|"|>...<|"|>,subject:<|"|>...<|"|>}<tool_call|>
+    """
+    # ── Format 3: model-native <|tool_call>call:NAME{k:<|"|>v<|"|>}<tool_call|> ──
+    native_m = re.search(
+        r'<\|tool_call\>call:(\w+)\{(.*?)\}(?:<tool_call\|>|$)',
+        content, re.DOTALL
+    )
+    if native_m:
+        tool_name = native_m.group(1)
+        args_str  = native_m.group(2)
+        args: dict = {}
+        # Each arg is: key:<|"|>value<|"|>
+        for kv in re.finditer(r'(\w+):<\|"\|>(.*?)<\|"\|>', args_str, re.DOTALL):
+            args[kv.group(1)] = kv.group(2).strip()
+        if tool_name and args:
+            return {"tool": tool_name, "args": args}
+        # Fallthrough: may have matched but args were empty — let other parsers try
+
+    # ── Format 2: fenced ```json … ``` block ─────────────────────────────────
     fence = re.search(r'```json\s*(.*?)\s*```', content, re.DOTALL)
     snippet = fence.group(1) if fence else content
 
-    # Try regex extraction first (more tolerant of surrounding text)
+    # ── Format 1a: regex extraction (tolerant of surrounding text) ────────────
     m = re.search(
         r'\{\s*"tool"\s*:\s*"([^"]+)"\s*,\s*"args"\s*:\s*(\{.*?\})\s*\}',
         snippet, re.DOTALL
@@ -570,7 +798,7 @@ def _parse_tool_call(content: str) -> Optional[dict]:
         except (json.JSONDecodeError, ValueError):
             pass
 
-    # Fall back to full JSON parse
+    # ── Format 1b: full JSON parse ────────────────────────────────────────────
     try:
         data = json.loads(snippet.strip())
         if isinstance(data, dict) and "tool" in data:
@@ -611,14 +839,334 @@ def _append_to_history(history: list, role: str, content, *, char_limit: int = M
     history.append({"role": role, "content": content})
 
 
+def _build_summary_from_dropped(dropped: list) -> str:
+    """
+    Produce a one-paragraph text summary of messages that are about to be
+    dropped from history so their key facts survive in the context window.
+    """
+    facts = []
+    i = 0
+    while i < len(dropped):
+        msg = dropped[i]
+        role    = msg.get("role", "")
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            i += 1
+            continue
+
+        if role == "user":
+            # Skip system-correction injections
+            if content.startswith("SYSTEM CORRECTION"):
+                i += 1
+                continue
+            # Tool result summaries — extract the key info
+            if content.startswith("Tool result ("):
+                facts.append(content[:200])
+                i += 1
+                continue
+            # Real user turn — pair with the next assistant turn if present
+            user_text = content[:120]
+            asst_text = ""
+            if i + 1 < len(dropped) and dropped[i + 1].get("role") == "assistant":
+                asst_raw = dropped[i + 1].get("content", "")
+                if isinstance(asst_raw, str):
+                    asst_text = asst_raw[:120]
+                i += 1  # consume assistant turn too
+            if asst_text:
+                facts.append(f'User said: "{user_text}" → Assistant: "{asst_text}"')
+            else:
+                facts.append(f'User said: "{user_text}"')
+        i += 1
+
+    if not facts:
+        return ""
+    return "Earlier in this conversation: " + " | ".join(facts)
+
+
 def _trim_history(history: list, max_messages: int = 31) -> list:
     """
     Keep the system message plus the most recent (max_messages-1) turns.
+
+    Improvements over the naive slice:
+    1. Never splits a user/assistant pair — always drops whole pairs from the
+       oldest end so the LLM never sees a dangling tool result with no call.
+    2. Builds a plain-text summary of the dropped messages and injects it as
+       a pinned second message so key facts (IDs, actions taken) survive.
+
     Returns a new list; does NOT mutate the original.
     """
     if len(history) <= max_messages:
         return history
-    return [history[0]] + history[-(max_messages - 1):]
+
+    system_msg = history[0]
+    body       = history[1:]          # everything after the system prompt
+
+    # Find any existing summary message we previously pinned (role=system, starts with "Earlier")
+    summary_offset = 0
+    if body and body[0].get("role") == "system" and \
+            isinstance(body[0].get("content", ""), str) and \
+            body[0]["content"].startswith("Earlier in this conversation"):
+        summary_offset = 1            # skip it; we will rebuild it
+
+    turns = body[summary_offset:]     # actual conversation turns
+
+    # How many turns we can keep
+    budget = max_messages - 1 - 1    # -1 system, -1 for summary slot
+    if len(turns) <= budget:
+        # Nothing to drop — just reattach system
+        return [system_msg] + body
+
+    # Drop oldest turns in pairs (user+assistant) to avoid split pairs
+    keep_start = len(turns) - budget
+    # Walk forward until we land on a user turn so we don't start mid-pair
+    while keep_start < len(turns) and turns[keep_start].get("role") != "user":
+        keep_start += 1
+
+    dropped = turns[:keep_start]
+    kept    = turns[keep_start:]
+
+    summary_text = _build_summary_from_dropped(dropped)
+    summary_msg  = {"role": "system", "content": summary_text} if summary_text else None
+
+    result = [system_msg]
+    if summary_msg:
+        result.append(summary_msg)
+    result.extend(kept)
+    return result
+
+
+def _summarize_tool_result(tool_name: str, res: dict) -> str:
+    """
+    Convert a raw MCP tool result dict into a compact history entry.
+    Preserves the signal the LLM needs (IDs, counts, key fields) without
+    storing the full JSON payload, which can be thousands of characters.
+    """
+    if not isinstance(res, dict):
+        return f"Tool result ({tool_name}): {str(res)[:300]}"
+
+    success = res.get("success", True)
+    if not success:
+        return f"Tool result ({tool_name}): ERROR — {res.get('error', 'unknown error')}"
+
+    result = res.get("result", res)
+
+    # ── Email list results ───────────────────────────────────────────────────
+    if isinstance(result, list) and result and isinstance(result[0], dict):
+        ids    = [e.get("id", "") for e in result if e.get("id")]
+        count  = len(result)
+        sample = result[0]
+        # Email-like entries
+        if "subject" in sample or "from" in sample:
+            subjects = [e.get("subject", "(no subject)") for e in result[:3]]
+            id_str   = ", ".join(ids[:5]) + ("…" if len(ids) > 5 else "")
+            return (
+                f"Tool result ({tool_name}): {count} email(s) returned. "
+                f"IDs: [{id_str}]. "
+                f"Subjects: {'; '.join(subjects)}"
+            )
+        # Generic list with IDs
+        if ids:
+            id_str = ", ".join(ids[:5]) + ("…" if len(ids) > 5 else "")
+            return f"Tool result ({tool_name}): {count} item(s). IDs: [{id_str}]"
+        return f"Tool result ({tool_name}): {count} item(s) returned."
+
+    # ── Single dict result ───────────────────────────────────────────────────
+    if isinstance(result, dict):
+        # Draft / send result
+        if "id" in result:
+            extra = ""
+            if "subject" in result:
+                extra = f", subject: {result['subject']}"
+            if "to" in result:
+                extra += f", to: {result['to']}"
+            return f"Tool result ({tool_name}): success. ID: {result['id']}{extra}"
+        # Label list
+        if "labels" in result:
+            names = [l.get("name", "") for l in result.get("labels", [])[:10]]
+            return f"Tool result ({tool_name}): {len(names)} label(s): {', '.join(names)}"
+        # Generic small dict — just truncate
+        brief = json.dumps(result)[:400]
+        return f"Tool result ({tool_name}): {brief}"
+
+    # ── Plain string / scalar ────────────────────────────────────────────────
+    return f"Tool result ({tool_name}): {str(result)[:400]}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Slot-filling state machine
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _check_pending_action(text: str, state: dict, mcp) -> Optional[str]:
+    """
+    If a multi-turn action is in progress (state["pending_action"]), try to fill
+    its next required slot from the user's message.  Executes as soon as all
+    required slots are satisfied.
+
+    Returns an HTML reply string, or None if there is no pending action or the
+    current message doesn't advance one.
+    """
+    action = state.get("pending_action")
+    if not action:
+        return None
+
+    atype = action["type"]
+    low   = text.lower().strip()
+
+    # ── User cancels ─────────────────────────────────────────────────────────
+    if re.search(r'\b(cancel|stop|never\s*mind|forget\s*it|abort|quit)\b', low):
+        state.pop("pending_action", None)
+        return "Okay, cancelled. What else can I help you with?"
+
+    # ── send_email / draft_email ──────────────────────────────────────────────
+    if atype in ("send_email", "draft_email"):
+        # Slot 1 — recipient
+        if not action.get("to"):
+            email = _extract_email(text)
+            if email:
+                action["to"] = email
+            else:
+                return (
+                    "I still need a recipient email address. "
+                    "Please share it, or say <b>cancel</b> to abort."
+                )
+
+        # Slot 2 — body (optional: accept any free-form text after recipient is set)
+        if not action.get("body") and not _extract_email(text):
+            # Non-address text after 'to' is filled → treat as body
+            if text.strip() and text.strip().lower() not in ("ok", "sure", "yes", "go", "send"):
+                action["body"] = text.strip()
+
+        # All required slots filled → execute
+        to      = action["to"]
+        body    = action.get("body") or "Hello!"
+        subject = action.get("subject") or (body[:60].split(".")[0].strip() or "Message from G-Assistant")
+        args: dict = {"to": to, "subject": subject, "body": body}
+        if state.get("last_attachment_path"):
+            args["attachment_path"] = state.pop("last_attachment_path")
+        state.pop("pending_action", None)
+
+        if atype == "draft_email":
+            res    = mcp.execute_tool("draft_email", args)
+            result = res.get("result", {}) if isinstance(res, dict) else {}
+            did    = result.get("id", "") if isinstance(result, dict) else ""
+            if did:
+                state.update(last_draft_id=did, last_to=to, last_body=body, last_subject=subject)
+            return (
+                f"📝 Draft created to <b>{to}</b>!<br>"
+                f"Draft ID: <code>{did}</code><br>Say <b>'send it'</b> to send."
+            )
+        res = mcp.execute_tool("send_email", args)
+        state.update(last_to=to, last_body=body, last_subject=subject)
+        return f"✅ Email sent to <b>{to}</b>!<br><br>{_fmt(res)}"
+
+    # ── reply_email ───────────────────────────────────────────────────────────
+    if atype == "reply_email":
+        mid = action.get("message_id")
+        if not mid:
+            ids = state.get("last_viewed_ids", [])
+            if ids:
+                mid = ids[0]
+                action["message_id"] = mid
+            else:
+                state.pop("pending_action", None)
+                return "I need an email to reply to. Show your emails first, then say 'reply'."
+
+        if not action.get("body"):
+            if text.strip():
+                action["body"] = text.strip()
+            else:
+                return "What would you like to say in the reply?"
+
+        res = mcp.execute_tool("reply_email", {"message_id": mid, "body": action["body"]})
+        state.pop("pending_action", None)
+        return f"✅ Reply sent!<br><br>{_fmt(res)}"
+
+    # ── forward_email ─────────────────────────────────────────────────────────
+    if atype == "forward_email":
+        mid = action.get("message_id") or (state.get("last_viewed_ids") or [None])[0]
+        if not mid:
+            state.pop("pending_action", None)
+            return "No email to forward. Show your emails first."
+
+        if not action.get("to"):
+            email = _extract_email(text)
+            if email:
+                action["to"] = email
+            else:
+                return "Who should I forward it to? Please share the recipient's email address."
+
+        res = mcp.execute_tool("forward_email", {
+            "message_id": mid,
+            "to":         action["to"],
+            "body":       action.get("body") or "",
+        })
+        state.pop("pending_action", None)
+        return f"↗️ Forwarded to <b>{action['to']}</b>!<br><br>{_fmt(res)}"
+
+    return None  # unknown action type — fall through
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reference resolution
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _resolve_refs(text: str, state: dict) -> str:
+    """
+    When the user refers to an entity by a semantic description rather than its
+    ID (e.g. "the invoice email", "the one from Sarah", "the budget doc"), look
+    it up in the entity registry and append a resolution hint so the LLM has a
+    concrete ID to act on.
+
+    Returns the original text unchanged if no match is found.
+    """
+    registry: dict = state.get("entity_registry", {})
+    if not registry:
+        return text
+
+    low = text.lower()
+
+    # ── "the [keyword] email/doc/sheet" ──────────────────────────────────────
+    kw_m = re.search(
+        r'\bthe\s+(\w+)\s+(?:email|mail|message|doc(?:ument)?|sheet|file|spreadsheet)\b', low
+    )
+    if kw_m:
+        kw = kw_m.group(1)
+        if kw not in _STOP_WORDS:
+            for eid, meta in reversed(list(registry.items())):  # most recent first
+                subject = meta.get("subject", "").lower()
+                name    = meta.get("name", "").lower()
+                if kw in subject or kw in name:
+                    label = meta.get("subject") or meta.get("name") or eid
+                    return text + f" [entity: {eid} — \"{label}\"]"
+
+    # ── "the one from [name]" / "email from [name]" ───────────────────────────
+    from_m = re.search(
+        r'\b(?:the\s+(?:one\s+|email\s+|message\s+)?)?from\s+([A-Za-z][a-zA-Z .]{1,24}?)(?:\s+about|\s*[,.\?!]|$)',
+        text
+    )
+    if from_m:
+        name_q = from_m.group(1).strip().lower()
+        if name_q and name_q not in _STOP_WORDS and len(name_q) > 2:
+            for eid, meta in reversed(list(registry.items())):
+                from_name = meta.get("from_name", "").lower()
+                from_addr = meta.get("from", "").lower()
+                if name_q in from_name or name_q in from_addr:
+                    label = meta.get("subject") or eid
+                    return text + f" [entity: {eid} — from \"{meta.get('from_name', '?')}\", \"{label}\"]"
+
+    # ── "about [topic]" ───────────────────────────────────────────────────────
+    about_m = re.search(r'\babout\s+([a-zA-Z]\w{2,})', low)
+    if about_m:
+        topic = about_m.group(1).lower()
+        if topic not in _STOP_WORDS:
+            for eid, meta in reversed(list(registry.items())):
+                subject = meta.get("subject", "").lower()
+                snippet = meta.get("snippet", "").lower()
+                if topic in subject or topic in snippet:
+                    label = meta.get("subject") or eid
+                    return text + f" [entity: {eid} — \"{label}\"]"
+
+    return text
 
 
 def _slim_vision_entry(history: list, image_name: str) -> None:
@@ -650,9 +1198,12 @@ You are G-Assistant operating in Gmail MCP mode.
 
 Context:
 - Current date: {current_date}
-- Recently listed email IDs: {viewed_ids}
 - Last draft ID: {last_draft_id}
 - Last recipient: {last_to}
+- Last subject: {last_subject}
+
+Known entities (emails seen this session — use these IDs for references like "it", "that", "the invoice email", "the one from Sarah"):
+{entity_context}
 
 RULES:
 1. Your primary job is Gmail/email actions. When in doubt about whether a request is
@@ -676,6 +1227,78 @@ Switch to **General Assistant** in the sidebar for other questions."
 5. NEVER call send_email unless the user provided a clear recipient email address.
    For ambiguous requests like "create a draft for the same", use draft_email with
    to="" and body based on context, or ask for the recipient.
+6. If the user says "update that", "write proper content for it", "rewrite the body",
+   "fix the draft", "make it better", "improve it" and last_draft_id is set → call
+   update_draft with last_draft_id. Generate full professional body content yourself
+   using last_subject and last_to as context.
+7. "show me that email" / "show me the sent mail" WITHOUT a hex ID → call
+   get_email_by_id using the most relevant ID from viewed_ids, NOT ask for clarification.
+
+INFORMATION EXTRACTION:
+- EMAIL ID: For words like "this", "that", "it", "the last one", "that email" → use the first ID from Recently listed email IDs above. For explicit hex IDs in the message, use them directly.
+- RECIPIENT: Use exact email addresses. Never guess an email from a name alone.
+- DATES: Compute from {current_date}. "This month" = first and last day of current month. "Last week" = 7 days ago to today.
+- CONTENT GENERATION: If user asks to write/draft/compose, generate full professional content yourself and include it in the "body" parameter — never leave it empty.
+
+TOOL GUIDE:
+- get_emails(limit)                             → list recent inbox emails
+- get_email_by_id(message_id)                   → read full email by ID
+- get_unread_emails()                           → list unread emails
+- get_starred_emails()                          → list starred/flagged emails
+- search_emails(query, limit)                   → search by keyword, from:, subject:, label:, etc.
+- get_emails_by_sender(sender, limit)           → all emails from a specific address
+- get_emails_by_label(label, limit)             → emails with a specific label
+- get_emails_by_date_range(start, end)          → emails between YYYY/MM/DD dates
+- get_email_thread(thread_id)                   → full conversation thread
+- send_email(to, subject, body)                 → send immediately
+- draft_email(to, subject, body)                → save as draft (do not send)
+- send_draft(draft_id)                          → send a saved draft
+- update_draft(draft_id, subject, body)         → edit an existing draft
+- delete_draft(draft_id)                        → discard a draft
+- reply_email(message_id, body)                 → reply to one email
+- reply_all(message_id, body)                   → reply to all recipients
+- forward_email(message_id, to, body)           → forward with optional note
+- trash_email(message_id)                       → move to trash
+- archive_email(message_id)                     → archive (remove from inbox, keep)
+- restore_email(message_id)                     → restore from trash
+- star_email(message_id)                        → add star/flag
+- unstar_email(message_id)                      → remove star
+- mark_as_read(message_id)                      → mark as read
+- mark_as_unread(message_id)                    → mark as unread
+- add_label(message_id, label)                  → tag email with a label
+- remove_label(message_id, label)               → remove a label from email
+- move_to_folder(message_id, folder)            → move to a specific folder
+- create_label(label_name)                      → create a new label
+- list_labels()                                 → list all labels
+- get_attachments(message_id)                   → list attachments in an email
+- schedule_email(to, subject, body, send_at)    → schedule email for a future time
+- set_email_reminder(message_id, reminder_time) → set a reminder on an email
+- count_emails_by_sender(sender)                → count how many emails from a sender
+- email_activity_summary()                      → overview of inbox activity
+- most_frequent_contacts()                      → who emails you the most
+- summarize_email(email)                        → AI: one-paragraph summary
+- classify_email(email)                         → AI: category (work/personal/promo/spam)
+- detect_urgency(email)                         → AI: urgency level (low/medium/high)
+- detect_action_required(email)                 → AI: what action is needed, if any
+- sentiment_analysis(email)                     → AI: positive / negative / neutral
+- extract_tasks(email)                          → AI: pull out to-do items
+- extract_dates(email)                          → AI: pull out dates and deadlines
+- extract_contacts(email)                       → AI: pull out names, emails, phones
+- extract_links(email)                          → AI: pull out all URLs
+- draft_reply(email, instructions)              → AI: generate a smart reply
+- generate_followup(email)                      → AI: generate a follow-up email
+- rewrite_email(email, instruction)             → AI: rewrite with given instruction
+- translate_email(email, target_language)       → AI: translate to target language
+- summarize_emails(emails)                      → AI: summarize a list of emails at once
+- auto_reply(email)                             → AI: generate an instant auto-reply
+- auto_label_emails(emails)                     → AI: auto-tag a batch of emails by topic
+- auto_reply_rules(rules)                       → AI: set up automatic reply rules
+- send_email_with_attachment(to, subject, body, attachment_path) → send email with a file attached
+- download_attachment(message_id, attachment_id) → download a specific attachment by ID
+- save_attachment_to_disk(message_id, attachment_id, path) → save an attachment to a local path
+- unarchive_email(message_id)                   → move archived email back to inbox
+- delete_email(message_id)                      → permanently delete (cannot be undone; prefer trash_email)
+- audit_email_history()                         → view a log of all G-Assistant email actions
 
 Tool call format (use ONLY this):
 ```json
@@ -684,6 +1307,191 @@ Tool call format (use ONLY this):
 
 Available Tools:
 {tool_list}
+
+EXAMPLES — CONTEXTUAL & UPDATE (0a-0c — read these first, they are critical):
+0a. User: "show me that mail" / "show me the sent email" (viewed_ids = 1a2b3c4d5e6f, no hex ID given)
+Your response: {{"tool": "get_email_by_id", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+(Use first ID from viewed_ids — NEVER ask for clarification if viewed_ids is available)
+
+0b. User: "please write the content in proper way for that" / "rewrite the body" / "make it better"
+(last_draft_id = r248908716247832671, last_to = shahnamya60@gmail.com, last_subject = How Are You?)
+Your response: {{"tool": "update_draft", "args": {{"draft_id": "r248908716247832671", "subject": "How Are You?", "body": "Dear Namya,\n\nI hope this message finds you well! I just wanted to reach out and check in — how have you been? It's been a while and I'd love to catch up.\n\nLooking forward to hearing from you!\n\nWarm regards,\n[Your Name]"}}}}
+
+0c. User: "update the draft with a professional version" (last_draft_id set, last_subject = Meeting Agenda)
+Your response: {{"tool": "update_draft", "args": {{"draft_id": "(last_draft_id)", "subject": "Meeting Agenda", "body": "Dear [Name],\n\nI am writing to share the agenda for our upcoming meeting. Please review the attached points and feel free to add any items you'd like to discuss.\n\nLooking forward to a productive session.\n\nBest regards,\n[Your Name]"}}}}
+
+EXAMPLES — READING & INBOX (1-8):
+1. User: "hey can you show me emails I got this month?"
+Your response: {{"tool": "get_emails_by_date_range", "args": {{"start": "2026/04/01", "end": "2026/04/30"}}}}
+
+2. User: "show me everything in my Work label"
+Your response: {{"tool": "get_emails_by_label", "args": {{"label": "work", "limit": 10}}}}
+
+3. User: "pull up the full conversation for this email" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "get_email_thread", "args": {{"thread_id": "1a2b3c4d5e6f"}}}}
+
+4. User: "how many times has vendor@shop.com emailed me?"
+Your response: {{"tool": "count_emails_by_sender", "args": {{"sender": "vendor@shop.com"}}}}
+
+5. User: "I want to see my promotions inbox"
+Your response: {{"tool": "get_emails_by_label", "args": {{"label": "promotions", "limit": 10}}}}
+
+6. User: "give me a quick overview of my email activity lately"
+Your response: {{"tool": "email_activity_summary", "args": {{}}}}
+
+7. User: "who sends me the most emails these days?"
+Your response: {{"tool": "most_frequent_contacts", "args": {{}}}}
+
+8. User: "find emails with 'invoice' in the subject"
+Your response: {{"tool": "search_emails", "args": {{"query": "subject:invoice", "limit": 10}}}}
+
+EXAMPLES — DRAFTING & COMPOSING (9-18):
+9. User: "write a professional apology to boss@company.com for missing today's meeting"
+Your response: {{"tool": "draft_email", "args": {{"to": "boss@company.com", "subject": "Apology for Missing Today's Meeting", "body": "Dear [Boss's Name],\n\nI sincerely apologize for missing today's meeting. I understand this may have caused inconvenience, and I take full responsibility.\n\nI would like to reschedule at your earliest convenience to ensure I am fully aligned with the team's progress. Please let me know a time that works for you.\n\nOnce again, I apologize for the disruption.\n\nBest regards,\n[Your Name]"}}}}
+
+10. User: "draft something to team@work.com letting them know Q4 targets are due this Friday"
+Your response: {{"tool": "draft_email", "args": {{"to": "team@work.com", "subject": "Reminder: Q4 Targets Due This Friday", "body": "Hi Team,\n\nJust a quick reminder that Q4 targets are due this Friday. Please ensure all reports are submitted by end of business day.\n\nIf you have any questions or need an extension, reach out to me before Thursday so we can sort it out.\n\nThanks for your hard work this quarter!\n\nBest,\n[Your Name]"}}}}
+
+11. User: "write a thank you email to recruiter@company.com for the interview yesterday"
+Your response: {{"tool": "draft_email", "args": {{"to": "recruiter@company.com", "subject": "Thank You for the Interview", "body": "Dear [Recruiter's Name],\n\nThank you so much for taking the time to interview me yesterday. I really enjoyed learning more about the role and the team, and I left feeling even more excited about the opportunity.\n\nOur conversation gave me a great sense of the company culture, and I am confident my skills in [relevant skill] would be a strong fit.\n\nI look forward to hearing from you about next steps. Please don't hesitate to reach out if you need any additional information.\n\nWarm regards,\n[Your Name]"}}}}
+
+12. User: "I need to email hr@company.com asking for 3 days of paid leave next week"
+Your response: {{"tool": "draft_email", "args": {{"to": "hr@company.com", "subject": "Paid Leave Request — Next Week", "body": "Dear HR Team,\n\nI am writing to formally request 3 days of paid leave from [Start Date] to [End Date] next week.\n\nI have ensured that my current tasks will be completed before my leave, and I will coordinate with my team to avoid any disruption to ongoing work.\n\nPlease let me know if you need any further information or if there is a form I need to fill out.\n\nThank you for your consideration.\n\nBest regards,\n[Your Name]"}}}}
+
+13. User: "draft a resignation letter for manager@company.com, keep it short and professional"
+Your response: {{"tool": "draft_email", "args": {{"to": "manager@company.com", "subject": "Resignation Letter", "body": "Dear [Manager's Name],\n\nI am writing to formally notify you of my resignation from my position as [Your Job Title], effective [Last Working Day — typically two weeks from today].\n\nI am grateful for the opportunities and experiences I have gained during my time here. I will do everything I can to ensure a smooth handover before my departure.\n\nThank you for your support and guidance.\n\nSincerely,\n[Your Name]"}}}}
+
+14. User: "reply to this email and say I'll get back to them by Friday" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "reply_email", "args": {{"message_id": "1a2b3c4d5e6f", "body": "Hi,\n\nThank you for reaching out. I'll review this and get back to you by Friday.\n\nBest regards,\n[Your Name]"}}}}
+
+15. User: "reply to everyone on this thread — the meeting is pushed to Thursday at 3pm" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "reply_all", "args": {{"message_id": "1a2b3c4d5e6f", "body": "Hi all,\n\nJust a quick update — the meeting has been rescheduled to Thursday at 3:00 PM. Please update your calendars accordingly.\n\nSorry for any inconvenience!\n\nBest,\n[Your Name]"}}}}
+
+16. User: "forward this to colleague@work.com and tell them to handle it" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "forward_email", "args": {{"message_id": "1a2b3c4d5e6f", "to": "colleague@work.com", "body": "Hi,\n\nPlease see the forwarded email below and handle it at your earliest convenience. Let me know if you need any additional context.\n\nThanks!"}}}}
+
+17. User: "schedule a reminder email to team@work.com for 9am tomorrow about the standup"
+Your response: {{"tool": "schedule_email", "args": {{"to": "team@work.com", "subject": "Standup Reminder", "body": "Hi team, just a reminder that our daily standup is in 30 minutes. See you there!", "send_at": "2026-04-16T09:00:00"}}}}
+
+18. User: "set a reminder on this email in 2 hours so I don't forget to reply" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "set_email_reminder", "args": {{"message_id": "1a2b3c4d5e6f", "reminder_time": "2026-04-15T14:00:00"}}}}
+
+EXAMPLES — AI-POWERED FEATURES (19-30):
+(For AI tools: FIRST call get_email_by_id to fetch the content, THEN call the AI tool with the returned email string.)
+
+19. User: "how urgent is this email?" (viewed_ids = 1a2b3c4d5e6f)
+Step 1 — fetch email: {{"tool": "get_email_by_id", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2 — after tool result: {{"tool": "detect_urgency", "args": {{"email": "(email content from tool result)"}}}}
+
+20. User: "what kind of email is this — work, personal, or promo?" (viewed_ids = 1a2b3c4d5e6f)
+Step 1: {{"tool": "get_email_by_id", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2: {{"tool": "classify_email", "args": {{"email": "(email content from tool result)"}}}}
+
+21. User: "does this email come across as negative or positive?" (viewed_ids = 1a2b3c4d5e6f)
+Step 1: {{"tool": "get_email_by_id", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2: {{"tool": "sentiment_analysis", "args": {{"email": "(email content from tool result)"}}}}
+
+22. User: "what tasks do I need to do after reading this email?" (viewed_ids = 1a2b3c4d5e6f)
+Step 1: {{"tool": "get_email_by_id", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2: {{"tool": "extract_tasks", "args": {{"email": "(email content from tool result)"}}}}
+
+23. User: "are there any deadlines or important dates in this email?" (viewed_ids = 1a2b3c4d5e6f)
+Step 1: {{"tool": "get_email_by_id", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2: {{"tool": "extract_dates", "args": {{"email": "(email content from tool result)"}}}}
+
+24. User: "grab all the contact info from this email" (viewed_ids = 1a2b3c4d5e6f)
+Step 1: {{"tool": "get_email_by_id", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2: {{"tool": "extract_contacts", "args": {{"email": "(email content from tool result)"}}}}
+
+25. User: "do I need to do anything after reading this email?" (viewed_ids = 1a2b3c4d5e6f)
+Step 1: {{"tool": "get_email_by_id", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2: {{"tool": "detect_action_required", "args": {{"email": "(email content from tool result)"}}}}
+
+26. User: "write a good reply to this email for me" (viewed_ids = 1a2b3c4d5e6f)
+Step 1: {{"tool": "get_email_by_id", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2: {{"tool": "draft_reply", "args": {{"email": "(email content from tool result)", "instructions": "professional and friendly"}}}}
+
+27. User: "generate a follow-up email for this conversation" (viewed_ids = 1a2b3c4d5e6f)
+Step 1: {{"tool": "get_email_by_id", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2: {{"tool": "generate_followup", "args": {{"email": "(email content from tool result)"}}}}
+
+28. User: "this email is too casual, make it sound more professional" (viewed_ids = 1a2b3c4d5e6f)
+Step 1: {{"tool": "get_email_by_id", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2: {{"tool": "rewrite_email", "args": {{"email": "(email content from tool result)", "instruction": "rewrite in a professional formal tone"}}}}
+
+29. User: "translate this email to English for me" (viewed_ids = 1a2b3c4d5e6f)
+Step 1: {{"tool": "get_email_by_id", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2: {{"tool": "translate_email", "args": {{"email": "(email content from tool result)", "target_language": "English"}}}}
+
+30. User: "pull out all the links from that email" (viewed_ids = 1a2b3c4d5e6f)
+Step 1: {{"tool": "get_email_by_id", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2: {{"tool": "extract_links", "args": {{"email": "(email content from tool result)"}}}}
+
+EXAMPLES — ORGANIZATION & MANAGEMENT (31-40):
+31. User: "move this email to my Work folder" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "move_to_folder", "args": {{"message_id": "1a2b3c4d5e6f", "folder": "Work"}}}}
+
+32. User: "take the spam label off this email, it's not spam" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "remove_label", "args": {{"message_id": "1a2b3c4d5e6f", "label": "spam"}}}}
+
+33. User: "does this email have any attachments?" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "get_attachments", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+
+34. User: "tag the last email with my Work label" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "add_label", "args": {{"message_id": "1a2b3c4d5e6f", "label": "Work"}}}}
+
+35. User: "can you create a new label called Follow-up?"
+Your response: {{"tool": "create_label", "args": {{"label_name": "Follow-up"}}}}
+
+36. User: "I accidentally deleted an email, can you bring it back?" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "restore_email", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+
+37. User: "auto clean up my promotional emails"
+Your response: {{"tool": "auto_archive_promotions", "args": {{}}}}
+
+38. User: "star this email so I can find it later" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "star_email", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+
+39. User: "I've already read this, mark it as read" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "mark_as_read", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+
+40. User: "unstar the last email, I don't need it flagged anymore" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "unstar_email", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+
+EXAMPLES — ATTACHMENTS, BATCH AI & ADVANCED (41-50):
+41. User: "can you summarize all the emails I just loaded?"
+Your response: {{"tool": "summarize_emails", "args": {{"emails": "(list of email content strings from viewed results)"}}}}
+
+42. User: "send an email to boss@company.com with the report attached"
+Your response: {{"tool": "send_email_with_attachment", "args": {{"to": "boss@company.com", "subject": "Report Attached", "body": "Hi,\n\nPlease find the report attached as requested. Let me know if you need anything else.\n\nBest regards,\n[Your Name]", "attachment_path": "(path to file)"}}}}
+
+43. User: "does this email have attachments? if yes, download them" (viewed_ids = 1a2b3c4d5e6f)
+Step 1 — list attachments: {{"tool": "get_attachments", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2 — after getting attachment_id from result: {{"tool": "download_attachment", "args": {{"message_id": "1a2b3c4d5e6f", "attachment_id": "(attachment_id from step 1 result)"}}}}
+
+44. User: "save the attachment from this email to my disk" (viewed_ids = 1a2b3c4d5e6f)
+Step 1: {{"tool": "get_attachments", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2: {{"tool": "save_attachment_to_disk", "args": {{"message_id": "1a2b3c4d5e6f", "attachment_id": "(attachment_id from step 1)", "path": "./downloads/"}}}}
+
+45. User: "I archived that email by mistake, bring it back to my inbox" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "unarchive_email", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+
+46. User: "permanently delete this email, I don't want it anywhere" (viewed_ids = 1a2b3c4d5e6f)
+Your response: {{"tool": "delete_email", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+
+47. User: "auto-label these emails by topic for me"
+Your response: {{"tool": "auto_label_emails", "args": {{"emails": "(list of email content strings from viewed results)"}}}}
+
+48. User: "write a quick auto-reply for this email" (viewed_ids = 1a2b3c4d5e6f)
+Step 1: {{"tool": "get_email_by_id", "args": {{"message_id": "1a2b3c4d5e6f"}}}}
+Step 2: {{"tool": "auto_reply", "args": {{"email": "(email content from tool result)"}}}}
+
+49. User: "set up an auto-reply rule for emails from clients"
+Your response: {{"tool": "auto_reply_rules", "args": {{"rules": [{{"condition": "from:client", "reply": "Thank you for reaching out! I will get back to you within 24 hours."}}]}}}}
+
+50. User: "show me a history of all the email actions G-Assistant has done"
+Your response: {{"tool": "audit_email_history", "args": {{}}}}
+
 """
 
 _GENERAL_SYSTEM_PROMPT = """\
@@ -719,7 +1527,9 @@ You are G-Assistant operating in Google Docs MCP mode.
 
 Context:
 - Date: {current_date}
-- Recent document IDs: {viewed_doc_ids}
+
+Known entities (docs seen this session — use these IDs for "it", "that doc", "the last one"):
+{entity_context}
 
 YOUR CAPABILITIES:
 You have FULL access to your LLM training knowledge AND Google Docs tools. Use BOTH seamlessly.
@@ -1076,6 +1886,7 @@ def _fmt_docs(res_data: dict) -> str:
 
 def _docs_intent_detect(text: str, mcp, state: dict) -> Optional[str]:
     """Return an HTML reply string, or None to fall through to the LLM."""
+    text = _resolve_refs(text, state)
     low  = text.lower().strip()
     dids = state.get("last_viewed_doc_ids", [])
     
@@ -1115,7 +1926,7 @@ def _docs_intent_detect(text: str, mcp, state: dict) -> Optional[str]:
         r'(?:google\s+)?docs?(?:uments?)?\b', low
     ) or low in {"docs", "documents", "my docs", "recent docs"}:
         res = mcp.execute_tool("list_docs", {"limit": 10})
-        ids = [d["id"] for d in (res.get("result") or []) if isinstance(d, dict)]
+        ids = _register_entities(state, "list_docs", res)
         state["last_viewed_doc_ids"] = ids
         return f"Your recent Google Docs:<br><br>{_fmt_docs(res)}"
 
@@ -1303,7 +2114,9 @@ You are G-Assistant operating in Google Sheets MCP mode.
 
 Context:
 - Date: {current_date}
-- Recent spreadsheet IDs: {viewed_sheet_ids}
+
+Known entities (sheets seen this session — use these IDs for "it", "that sheet", "the last one"):
+{entity_context}
 
 YOUR JOB: Convert the user's request into a single JSON tool call for Google Sheets.
 Output ONLY the JSON block — no text before or after it.
@@ -1444,11 +2257,785 @@ def _fmt_sheets(res_data: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Google Drive HTML formatter
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fmt_drive(res_data: dict) -> str:
+    """Render Drive tool results as HTML."""
+    if not isinstance(res_data, dict) or "success" not in res_data:
+        return str(res_data)
+    if not res_data.get("success"):
+        return f"<b style='color:#ef4444'>Error:</b> {res_data.get('error', 'Unknown error')}"
+
+    res = res_data.get("result", "")
+
+    _TYPE_ICONS = {
+        "Folder": "📁", "Google Doc": "📄", "Google Sheet": "📊",
+        "Google Slides": "📑", "PDF": "📕", "PNG Image": "🖼️",
+        "JPEG Image": "🖼️", "Text File": "📝", "CSV File": "📋",
+    }
+
+    def _file_card(f: dict) -> str:
+        name  = f.get("name", "(Untitled)")
+        fid   = f.get("id", "")
+        ftype = f.get("type", "File")
+        mod   = f.get("modified", "")
+        url   = f.get("url", "")
+        icon  = _TYPE_ICONS.get(ftype, "📎")
+        link  = (
+            f"<a href='{url}' target='_blank' style='color:var(--primary)'>{icon} {name}</a>"
+            if url else f"<b>{icon} {name}</b>"
+        )
+        meta  = f"<span style='color:var(--text-muted);font-size:12px'>ID: {fid}"
+        if mod:
+            meta += f" · {mod}"
+        if ftype:
+            meta += f" · {ftype}"
+        meta += "</span>"
+        return (
+            f"<div style='padding:8px 10px;margin:5px 0;background:rgba(99,102,241,.08);"
+            f"border-left:3px solid var(--primary);border-radius:4px'>"
+            f"{link}<br>{meta}</div>"
+        )
+
+    def _render(data) -> str:
+        if isinstance(data, list):
+            if not data:
+                return "No files found."
+            # List of permission dicts
+            if data and isinstance(data[0], dict) and "role" in data[0] and "email" in data[0]:
+                lines = []
+                for p in data:
+                    badge = (
+                        f"<span style='background:rgba(99,102,241,0.2);padding:1px 6px;"
+                        f"border-radius:4px;font-size:12px'>{p.get('role','')}</span>"
+                    )
+                    lines.append(
+                        f"<div style='padding:4px 0'>"
+                        f"{p.get('email') or p.get('type','unknown')} {badge}</div>"
+                    )
+                return "".join(lines)
+            # List of file dicts
+            if isinstance(data[0], dict) and "id" in data[0]:
+                return "".join(_file_card(f) for f in data)
+            return "<br>".join(str(x) for x in data)
+
+        if isinstance(data, dict):
+            # Single file metadata
+            if "name" in data and "id" in data and "type" in data:
+                return _file_card(data)
+            # Storage info
+            if "used" in data and "total" in data:
+                return (
+                    f"<b>Storage Used:</b> {data.get('used')} / {data.get('total')}<br>"
+                    f"<b>Free:</b> {data.get('free')}<br>"
+                    f"<b>Percent Used:</b> {data.get('percent_used')}"
+                )
+            # Generic success dict
+            lines = [
+                f"<b>{k.replace('_', ' ').capitalize()}:</b> {_render(v)}"
+                for k, v in data.items()
+                if v not in (None, "", [], {}) and k not in ("success",)
+            ]
+            return "<br>".join(lines) if lines else "Done."
+
+        return str(data).replace("\n", "<br>")
+
+    if isinstance(res, str):
+        return res.replace("\n", "<br>")
+    return _render(res)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Google Drive upload handler  (called when user attaches a file in Drive mode)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_FOLDER_SKIP_WORDS = frozenset({
+    "this", "the", "a", "an", "my", "that", "it", "drive",
+    "google", "new", "create", "upload", "put", "add", "here",
+    "root", "file", "image", "photo", "document", "attachment",
+})
+
+
+def _drive_upload_handler(user_input: str, mcp, state: dict) -> Optional[str]:
+    """
+    If a file was attached while in Drive mode, upload it to Google Drive.
+
+    Handles three folder-resolution strategies in order:
+      1. User says "create a folder named X" → create the folder, upload into it.
+      2. Explicit Drive file-system ID found in the message → upload into that folder.
+      3. Folder name found in the message → search/registry lookup, then upload.
+      4. No folder specified → upload to Drive root.
+    """
+    from pathlib import Path as _Path
+
+    fpath = state.pop("last_attachment_path", None)
+    if not fpath:
+        return None
+
+    fname = _Path(fpath).name
+    low   = user_input.lower()
+
+    folder_id   = None
+    folder_name = None
+    created_msg = ""   # extra line shown when we auto-created the folder
+
+    # ── Strategy 1: "create a folder named X" + upload ───────────────────────
+    create_m = re.search(
+        r'\bcreate\s+(?:a\s+)?(?:new\s+)?folder\s+(?:called|named)?\s*'
+        r'["\']?([^\s"\'?!.,\n]+)["\']?',
+        low,
+    )
+    if create_m:
+        raw_name    = create_m.group(1).strip()
+        folder_name = raw_name
+        cr          = mcp.execute_tool("create_folder", {"name": folder_name})
+        if isinstance(cr, dict) and cr.get("success"):
+            result = cr.get("result", {})
+            if isinstance(result, dict) and result.get("id"):
+                folder_id   = result["id"]
+                folder_name = result.get("name", folder_name)
+                new_ids     = _register_entities(state, "create_folder", cr)
+                if new_ids:
+                    state["last_viewed_drive_ids"] = new_ids
+                created_msg = f"📁 Created folder <b>{folder_name}</b>.<br>"
+            else:
+                created_msg = f"⚠️ Folder creation may have failed; uploading to root.<br>"
+                folder_name = None
+        else:
+            err = cr.get("error", "Unknown") if isinstance(cr, dict) else str(cr)
+            created_msg = f"⚠️ Couldn't create folder: {err}. Uploading to root.<br>"
+            folder_name = None
+
+    # ── Strategy 2: explicit 25+ char Drive ID in message ────────────────────
+    if not folder_id:
+        id_m = re.search(r'[A-Za-z0-9_-]{25,}', user_input)
+        if id_m:
+            folder_id = id_m.group(0)
+
+    # ── Strategy 3: parse folder name and find/search it ─────────────────────
+    if not folder_id:
+        name_m = (
+            # "upload to yellow folder" / "put it in yellow folder"
+            re.search(
+                r'\b(?:in|to|into|upload\s+(?:it\s+)?(?:in|to|into))\s+'
+                r'(?:the\s+|my\s+)?(?:folder\s+)?["\']?([^\s"\'?,!.\n]+)["\']?\s+folder\b',
+                low,
+            )
+            # "upload to folder yellow"
+            or re.search(
+                r'\b(?:in|to|into|upload\s+(?:it\s+)?(?:in|to|into))\s+'
+                r'folder\s+["\']?([^\s"\'?,!.\n]+)["\']?\b',
+                low,
+            )
+            # "put it in yellow" / "upload in yellow"
+            or re.search(
+                r'\b(?:in|to|into)\s+(?:the\s+|my\s+)?["\']?([^\s"\'?,!.\n]+)["\']?\s+folder\b',
+                low,
+            )
+            # bare "[name] folder" anywhere
+            or re.search(r'\b([^\s"\'?,!.\n]+)\s+folder\b', low)
+        )
+        if name_m:
+            candidate = name_m.group(1).strip().lower()
+            if candidate not in _FOLDER_SKIP_WORDS and len(candidate) > 1:
+                folder_name = name_m.group(1).strip()
+                # Check entity registry first (avoids a live API call)
+                hit = _find_drive_id_by_name(folder_name, state)
+                if hit:
+                    folder_id, folder_name = hit
+                else:
+                    # Live search Drive
+                    res  = mcp.execute_tool("search_files", {"query": folder_name, "limit": 10})
+                    hits = (res.get("result") or []) if isinstance(res, dict) else []
+                    # Prefer actual folder types
+                    folders = [
+                        h for h in hits
+                        if h.get("type") == "Folder"
+                        or h.get("mime") == "application/vnd.google-apps.folder"
+                    ]
+                    bucket = folders or hits
+                    if bucket:
+                        folder_id   = bucket[0]["id"]
+                        folder_name = bucket[0]["name"]
+                        state["last_viewed_drive_ids"] = [folder_id]
+                        _register_entities(state, "search_files", res)
+                    else:
+                        return (
+                            f"⚠️ Couldn't find a folder named <b>{folder_name}</b> in your Drive.<br>"
+                            f"Say <b>'create a folder named {folder_name} and upload this'</b> to create it, "
+                            f"or <b>'upload to Drive root'</b> to skip the folder."
+                        )
+
+    # ── Execute the upload ───────────────────────────────────────────────────
+    args: dict = {"file_path": fpath}
+    if folder_id:
+        args["folder_id"] = folder_id
+
+    try:
+        res = mcp.execute_tool("upload_file", args)
+    except Exception as exc:
+        return f"<b style='color:#ef4444'>❌ Upload failed:</b> {exc}"
+
+    new_ids = _register_entities(state, "upload_file", res)
+    if new_ids:
+        state["last_viewed_drive_ids"] = new_ids
+
+    if isinstance(res, dict) and res.get("success"):
+        dest = f"folder <b>{folder_name}</b>" if folder_name else "your Drive (root)"
+        return (
+            created_msg
+            + f"✅ Uploaded <b>{fname}</b> to {dest}!<br><br>"
+            + _fmt_drive(res)
+        )
+
+    err = res.get("error", "Unknown error") if isinstance(res, dict) else str(res)
+    return f"{created_msg}<b style='color:#ef4444'>❌ Upload failed:</b> {err}"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Google Drive intent router  (zero-latency fast path)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_DRIVE_ID_RE = re.compile(r'[A-Za-z0-9_-]{25,}')
+
+
+def _extract_drive_id(text: str) -> Optional[str]:
+    m = _DRIVE_ID_RE.search(text)
+    return m.group(0) if m else None
+
+
+def _get_last_drive_id(state: dict) -> Optional[str]:
+    """Return the most recently interacted-with Drive file/folder ID."""
+    ids = state.get("last_viewed_drive_ids", [])
+    return ids[0] if ids else None
+
+
+def _find_drive_id_by_name(query: str, state: dict) -> Optional[tuple[str, str]]:
+    """
+    Look up a file/folder by name in the entity registry.
+    Returns (file_id, display_name) or None.
+    Case-insensitive substring match; most-recent registry entry wins.
+    """
+    registry = state.get("entity_registry", {})
+    q = query.lower().strip()
+    for eid, meta in reversed(list(registry.items())):
+        if meta.get("type") == "drive":
+            if q in meta.get("name", "").lower():
+                return eid, meta["name"]
+    return None
+
+
+def _drive_intent_detect(text: str, mcp, state: dict) -> Optional[str]:
+    """Return an HTML reply string, or None to fall through to the LLM."""
+    text = _resolve_refs(text, state)
+    low  = text.lower().strip()
+
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _exec(tool: str, args: dict, success_msg: str) -> str:
+        try:
+            res = mcp.execute_tool(tool, args)
+            new_ids = _register_entities(state, tool, res)
+            if new_ids:
+                state["last_viewed_drive_ids"] = new_ids
+            if isinstance(res, dict) and res.get("success") is False:
+                err = res.get("error", "Unknown error")
+                return f"<b style='color:#ef4444'>❌ Failed:</b> {err}"
+            return success_msg + "<br><br>" + _fmt_drive(res)
+        except PermissionError as e:
+            return f"<b style='color:#ef4444'>🔒 Auth Required:</b> {str(e)}"
+
+    def _need_id(action: str) -> str:
+        """Return a friendly prompt when we have no ID context."""
+        return (
+            f"I need to know which file or folder to {action}. "
+            "Please <b>paste its ID</b> or name it (I'll search for it), "
+            "or say <b>'list my files'</b> first so I can see what's available."
+        )
+
+    def _resolve_fid(low_text: str) -> Optional[str]:
+        """Try explicit ID → contextual last → name lookup."""
+        m = _DRIVE_ID_RE.search(low_text)
+        if m:
+            return m.group(0)
+        fid = _get_last_drive_id(state)
+        return fid
+
+    def _name_then_act(name: str, tool: str, extra_args: dict, success_prefix: str) -> str:
+        """Look up file by name in registry, then execute tool on it."""
+        hit = _find_drive_id_by_name(name, state)
+        if hit:
+            fid, display = hit
+            return _exec(tool, {"file_id": fid, **extra_args},
+                         f"{success_prefix} <b>{display}</b>")
+        # Not in registry — search Drive live
+        res = mcp.execute_tool("search_files", {"query": name, "limit": 5})
+        hits = (res.get("result") or []) if isinstance(res, dict) else []
+        if not hits:
+            return f"⚠️ Couldn't find any file or folder named <b>{name}</b>."
+        if len(hits) == 1:
+            fid = hits[0]["id"]
+            state["last_viewed_drive_ids"] = [fid]
+            _register_entities(state, "search_files", res)
+            return _exec(tool, {"file_id": fid, **extra_args},
+                         f"{success_prefix} <b>{hits[0]['name']}</b>")
+        # Multiple matches — list them and ask
+        _register_entities(state, "search_files", res)
+        state["last_viewed_drive_ids"] = [h["id"] for h in hits]
+        return (
+            f"Found <b>{len(hits)}</b> items named <b>{name}</b>. "
+            f"Which one did you mean?<br><br>{_fmt_drive(res)}"
+        )
+
+    # ── Greetings ─────────────────────────────────────────────────────────────
+    if re.match(r'^(hi+|hello+|hey+|howdy|greetings?)[\s!?.]*$', low):
+        return (
+            "👋 <b>Hi! I'm G-Assistant in Google Drive MCP mode.</b><br><br>"
+            "Here's what I can do:<br>"
+            "• <b>Browse</b> — <code>list my files</code> · <code>show folders</code> · "
+            "<code>starred files</code> · <code>recent files</code><br>"
+            "• <b>Search</b> — <code>find budget</code> · <code>find all PDFs</code><br>"
+            "• <b>Upload</b> — attach a file using 📎, then say <code>upload to nnn folder</code><br>"
+            "• <b>Create</b> — <code>create folder Projects</code><br>"
+            "• <b>Organise</b> — rename, move, copy by ID or name<br>"
+            "• <b>Trash / restore / delete</b> — works on the last item you touched<br>"
+            "• <b>Share</b> — <code>share this with alice@example.com as editor</code><br>"
+            "• <b>Links</b> — <code>get shareable link</code> · <code>make private</code><br>"
+            "• <b>Storage</b> — <code>how much space do I have?</code><br><br>"
+            "Just tell me what you need!"
+        )
+
+    # ── Cancel pending action ─────────────────────────────────────────────────
+    if re.search(r'\b(cancel|stop|never\s*mind|forget\s*it|abort)\b', low):
+        state.pop("pending_drive_action", None)
+        return "Okay, cancelled. What else can I help you with?"
+
+    # ── Slot-filling: advance any in-progress Drive action ────────────────────
+    pending = state.get("pending_drive_action")
+    if pending:
+        atype = pending["type"]
+        # share — waiting for recipient
+        if atype == "share_file" and not pending.get("email"):
+            email_m = _EMAIL_RE.search(text)
+            if email_m:
+                pending["email"] = email_m.group(0)
+            else:
+                return "I still need an email address. Who should I share it with?"
+        if atype == "share_file" and pending.get("email"):
+            fid   = pending["file_id"]
+            email = pending["email"]
+            role  = pending.get("role", "reader")
+            state.pop("pending_drive_action", None)
+            return _exec("share_file", {"file_id": fid, "email": email, "role": role},
+                         f"✅ Shared with <b>{email}</b> as <b>{role}</b>!")
+        # rename — waiting for new name
+        if atype == "rename_file" and not pending.get("new_name"):
+            name_m = re.search(r'["\']?(.+?)["\']?\s*$', text.strip())
+            if name_m:
+                pending["new_name"] = name_m.group(1).strip()
+        if atype == "rename_file" and pending.get("new_name"):
+            fid      = pending["file_id"]
+            new_name = pending["new_name"]
+            state.pop("pending_drive_action", None)
+            return _exec("rename_file", {"file_id": fid, "new_name": new_name},
+                         f"✏️ Renamed to <b>{new_name}</b>!")
+
+    # ── List / browse all files ───────────────────────────────────────────────
+    if re.search(
+        r'\b(?:list|show|get|see|view|display|browse)\s+(?:all\s+|my\s+)?'
+        r'(?:files?|drive\s+files?|google\s+drive|drive)\b', low
+    ) or low in {"files", "drive", "my drive", "list files", "show files"}:
+        res = mcp.execute_tool("list_files", {"limit": 15})
+        ids = _register_entities(state, "list_files", res)
+        state["last_viewed_drive_ids"] = ids
+        return f"Your Google Drive files:<br><br>{_fmt_drive(res)}"
+
+    # ── List folders ──────────────────────────────────────────────────────────
+    if re.search(r'\b(?:list|show|get|see|browse)\s+(?:all\s+|my\s+)?folders?\b', low) \
+            or re.search(r'\bfolders?\s+in\s+(?:my\s+)?drive\b', low) \
+            or low in {"folders", "my folders"}:
+        res = mcp.execute_tool("list_folders", {"limit": 20})
+        ids = _register_entities(state, "list_folders", res)
+        state["last_viewed_drive_ids"] = ids
+        return f"Your Google Drive folders:<br><br>{_fmt_drive(res)}"
+
+    # ── Starred files ─────────────────────────────────────────────────────────
+    if re.search(r'\b(?:starred|favourited?|important)\s+(?:files?|items?)?\b', low):
+        res = mcp.execute_tool("get_starred_files", {"limit": 20})
+        ids = _register_entities(state, "get_starred_files", res)
+        state["last_viewed_drive_ids"] = ids
+        return f"Your starred Drive files:<br><br>{_fmt_drive(res)}"
+
+    # ── Recent files ──────────────────────────────────────────────────────────
+    if re.search(
+        r'\b(?:recent|recently\s+(?:modified|changed|edited)|latest)\s*'
+        r'(?:files?|items?|documents?|folders?)?\b', low
+    ) and re.search(r'\b(?:drive|file|folder|document)\b', low):
+        res = mcp.execute_tool("get_recent_files", {"limit": 10})
+        ids = _register_entities(state, "get_recent_files", res)
+        state["last_viewed_drive_ids"] = ids
+        return f"Your recently modified files:<br><br>{_fmt_drive(res)}"
+
+    # ── Storage info ──────────────────────────────────────────────────────────
+    if re.search(
+        r'\b(?:storage|space|quota|disk|how\s+much\s+(?:space|storage)|storage\s+used)\b', low
+    ):
+        res = mcp.execute_tool("get_storage_info", {})
+        return f"Google Drive storage:<br><br>{_fmt_drive(res)}"
+
+    # ── Search by file type ───────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:find|search|show|list|get)\s+(?:all\s+)?(?:my\s+)?'
+        r'(?:google\s+)?(docs?|sheets?|pdfs?|slides?|images?|folders?|csvs?|zips?)\b', low
+    )
+    if m:
+        raw   = m.group(1)
+        ftype = raw.rstrip("s") if raw.endswith("s") and not raw.endswith("ss") else raw
+        res   = mcp.execute_tool("search_files_by_type", {"file_type": ftype, "limit": 15})
+        ids   = _register_entities(state, "search_files_by_type", res)
+        state["last_viewed_drive_ids"] = ids
+        return f"Your {raw} files:<br><br>{_fmt_drive(res)}"
+
+    # ── Search by keyword ─────────────────────────────────────────────────────
+    m = (
+        re.search(
+            r'\b(?:search|find|look\s+for)\s+(?:files?\s+|folders?\s+)?'
+            r'(?:named?|called|about|containing|with|for)\s+["\']?(.+?)["\']?\s*$', low
+        )
+        or re.search(r'\b(?:search|find)\s+["\']([^"\']+)["\']', low)
+        or re.search(r'\bsearch\s+(?:for\s+)?(\w[\w\s]{1,30})\s*$', low)
+    )
+    if m:
+        q = m.group(1).strip()
+        if len(q) > 1 and q not in ("file", "files", "folder", "folders"):
+            res = mcp.execute_tool("search_files", {"query": q, "limit": 10})
+            ids = _register_entities(state, "search_files", res)
+            state["last_viewed_drive_ids"] = ids
+            return f"Search results for <b>{q}</b>:<br><br>{_fmt_drive(res)}"
+
+    # ── Get metadata: explicit ID, contextual "this/it", or name ─────────────
+    m = re.search(
+        r'\b(?:info|details?|metadata|about|open|show|get|view)\s+'
+        r'(?:file\s+|folder\s+)?(?:id\s+)?([A-Za-z0-9_-]{25,})\b', low
+    )
+    if m:
+        fid = m.group(1)
+        res = mcp.execute_tool("get_file_metadata", {"file_id": fid})
+        _register_entities(state, "get_file_metadata", res)
+        state["last_viewed_drive_ids"] = [fid]
+        return f"File details:<br><br>{_fmt_drive(res)}"
+
+    if re.search(
+        r'\b(?:info|details?|metadata|show|open|view)\s+(?:on\s+|for\s+)?'
+        r'(?:this|it|that|the\s+(?:last|latest|current)\s+(?:one|file|folder))\b', low
+    ):
+        fid = _get_last_drive_id(state)
+        if fid:
+            res = mcp.execute_tool("get_file_metadata", {"file_id": fid})
+            return f"File details:<br><br>{_fmt_drive(res)}"
+
+    # ── Folder contents ───────────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:open|browse|list|show|contents?\s+of)\s+folder\s+([A-Za-z0-9_-]{25,})\b', low
+    )
+    if m:
+        fid = m.group(1)
+        return _exec("get_folder_contents", {"folder_id": fid, "limit": 20},
+                     f"Contents of folder:")
+
+    if re.search(
+        r'\b(?:open|browse|list|show)\s+(?:this\s+|the\s+)?folder\b', low
+    ):
+        fid = _get_last_drive_id(state)
+        if fid:
+            return _exec("get_folder_contents", {"folder_id": fid, "limit": 20},
+                         "Folder contents:")
+
+    # ── Create folder ─────────────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:create|make|new|add)\s+(?:a\s+)?folder\s+'
+        r'(?:called|named)?\s*["\']?([^\s"\'?!.,]+)["\']?',
+        low
+    )
+    if m:
+        name = m.group(1)
+        return _exec("create_folder", {"name": name}, f"📁 Folder <b>{name}</b> created!")
+
+    # ── Rename — explicit ID ──────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:rename|name)\s+(?:file\s+|folder\s+)?([A-Za-z0-9_-]{25,})\s+'
+        r'(?:to|as)\s+["\']?(.+?)["\']?\s*$', low
+    )
+    if m:
+        fid, new_name = m.group(1), m.group(2).strip()
+        return _exec("rename_file", {"file_id": fid, "new_name": new_name},
+                     f"✏️ Renamed to <b>{new_name}</b>!")
+
+    # ── Rename — contextual "rename this to X" ────────────────────────────────
+    m = re.search(
+        r'\b(?:rename|name)\s+(?:this|it|that|the\s+(?:last|current)\s+(?:one|file|folder))\s+'
+        r'(?:to|as)\s+["\']?(.+?)["\']?\s*$', low
+    )
+    if m:
+        fid = _get_last_drive_id(state)
+        if fid:
+            return _exec("rename_file", {"file_id": fid, "new_name": m.group(1).strip()},
+                         f"✏️ Renamed to <b>{m.group(1).strip()}</b>!")
+
+    # ── Rename — by name "rename [name] to [new]" ─────────────────────────────
+    m = re.search(
+        r'\brename\s+(?!this|it|that)([^\s].+?)\s+(?:to|as)\s+["\']?(.+?)["\']?\s*$', low
+    )
+    if m:
+        old_name = m.group(1).strip()
+        new_name = m.group(2).strip()
+        if len(old_name) < 40:  # avoid matching a raw ID
+            return _name_then_act(old_name, "rename_file", {"new_name": new_name},
+                                  f"✏️ Renamed to <b>{new_name}</b> —")
+
+    # ── Rename — slot-fill: ask for new name ─────────────────────────────────
+    if re.search(r'\b(?:rename|name)\s+(?:this|it|that)\b', low):
+        fid = _get_last_drive_id(state)
+        if fid:
+            state["pending_drive_action"] = {"type": "rename_file", "file_id": fid}
+            return "What should I rename it to?"
+
+    # ── Move — explicit IDs ───────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:move)\s+(?:file\s+|folder\s+)?([A-Za-z0-9_-]{25,})\s+'
+        r'(?:to|into)\s+(?:folder\s+)?([A-Za-z0-9_-]{25,})\b', low
+    )
+    if m:
+        fid, dest = m.group(1), m.group(2)
+        return _exec("move_file", {"file_id": fid, "destination_folder_id": dest}, "📦 File moved!")
+
+    # ── Copy — explicit ID ────────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:copy|duplicate)\s+(?:file\s+|folder\s+)?([A-Za-z0-9_-]{25,})'
+        r'(?:\s+(?:as|named?)\s+["\']?(.+?)["\']?)?\s*$', low
+    )
+    if m:
+        fid      = m.group(1)
+        new_name = (m.group(2) or "").strip()
+        args: dict = {"file_id": fid}
+        if new_name:
+            args["new_name"] = new_name
+        return _exec("copy_file", args, "📋 File copied!")
+
+    # ── Copy — contextual "copy this" ─────────────────────────────────────────
+    m = re.search(
+        r'\b(?:copy|duplicate)\s+(?:this|it|that|the\s+(?:last|current)\s+(?:one|file|folder))'
+        r'(?:\s+(?:as|named?)\s+["\']?(.+?)["\']?)?\s*$', low
+    )
+    if m:
+        fid = _get_last_drive_id(state)
+        if fid:
+            args = {"file_id": fid}
+            if m.group(1):
+                args["new_name"] = m.group(1).strip()
+            return _exec("copy_file", args, "📋 File copied!")
+
+    # ── Trash — explicit ID ───────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:trash|delete|remove)\s+(?:file\s+|folder\s+)?([A-Za-z0-9_-]{25,})\b', low
+    )
+    if m:
+        fid = m.group(1)
+        res = mcp.execute_tool("get_file_metadata", {"file_id": fid})
+        name = (res.get("result") or {}).get("name", fid) if isinstance(res, dict) else fid
+        return _exec("trash_file", {"file_id": fid}, f"🗑️ <b>{name}</b> moved to trash.")
+
+    # ── Trash — contextual "delete this/it/that/the folder" ──────────────────
+    if re.search(
+        r'\b(?:trash|delete|remove)\s+'
+        r'(?:this|it|that|the\s+(?:last|latest|current)\s+(?:one|file|folder)'
+        r'|this\s+(?:file|folder)|the\s+(?:file|folder))\b', low
+    ):
+        fid = _get_last_drive_id(state)
+        if fid:
+            registry = state.get("entity_registry", {})
+            name = registry.get(fid, {}).get("name", fid)
+            return _exec("trash_file", {"file_id": fid}, f"🗑️ <b>{name}</b> moved to trash.")
+        return _need_id("delete")
+
+    # ── Trash — by name "delete folder nmy" / "delete file report" ───────────
+    m = re.search(
+        r'\b(?:trash|delete|remove)\s+(?:(?:this\s+)?(?:file|folder)\s+)'
+        r'([^\s].{0,40}?)\s*$', low
+    )
+    if m:
+        name = m.group(1).strip()
+        # ignore if it looks like a raw ID (already handled above)
+        if name and not _DRIVE_ID_RE.fullmatch(name):
+            return _name_then_act(name, "trash_file", {}, "🗑️ Moved to trash —")
+
+    # ── Restore — explicit ID ─────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:restore|recover|undelete|untrash)\s+(?:file\s+|folder\s+)?([A-Za-z0-9_-]{25,})\b',
+        low
+    )
+    if m:
+        fid = m.group(1)
+        return _exec("restore_file", {"file_id": fid}, f"♻️ File <b>{fid}</b> restored!")
+
+    # ── Restore — contextual ──────────────────────────────────────────────────
+    if re.search(
+        r'\b(?:restore|recover|undelete|untrash)\s+'
+        r'(?:this|it|that|the\s+(?:last|current)\s+(?:one|file|folder))\b', low
+    ):
+        fid = _get_last_drive_id(state)
+        if fid:
+            return _exec("restore_file", {"file_id": fid}, "♻️ File restored!")
+        return _need_id("restore")
+
+    # ── Permanently delete ────────────────────────────────────────────────────
+    m = re.search(
+        r'\bpermanently\s+delete\s+(?:file\s+|folder\s+)?([A-Za-z0-9_-]{25,})\b', low
+    )
+    if m:
+        fid = m.group(1)
+        return _exec("delete_file", {"file_id": fid},
+                     f"❌ File <b>{fid}</b> permanently deleted.")
+
+    if re.search(r'\bpermanently\s+delete\s+(?:this|it|that)\b', low):
+        fid = _get_last_drive_id(state)
+        if fid:
+            return _exec("delete_file", {"file_id": fid}, "❌ Permanently deleted.")
+        return _need_id("permanently delete")
+
+    # ── Permissions: explicit ID ──────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:permissions?|who\s+(?:has|can)\s+(?:access|view|edit|see))'
+        r'\b.*?([A-Za-z0-9_-]{25,})', low
+    )
+    if not m:
+        m = re.search(
+            r'([A-Za-z0-9_-]{25,}).*?\b(?:permissions?|shared\s+with)\b', low
+        )
+    if m:
+        fid = m.group(1)
+        return _exec("get_file_permissions", {"file_id": fid}, "Sharing permissions:")
+
+    # ── Permissions: contextual ───────────────────────────────────────────────
+    if re.search(
+        r'\b(?:permissions?|who\s+(?:has|can)\s+(?:access|view|edit|see)'
+        r'|shared\s+with|access\s+(?:list|for\s+this))\b', low
+    ):
+        fid = _get_last_drive_id(state)
+        if fid:
+            registry = state.get("entity_registry", {})
+            name = registry.get(fid, {}).get("name", fid)
+            return _exec("get_file_permissions", {"file_id": fid},
+                         f"Sharing permissions for <b>{name}</b>:")
+
+    # ── Share — "share [ID] with [email] as [role]" ───────────────────────────
+    m = re.search(
+        r'\bshare\s+(?:file\s+|folder\s+)?([A-Za-z0-9_-]{25,})\s+with\s+'
+        r'([\w.+-]+@[\w-]+\.[a-zA-Z]{2,})'
+        r'(?:\s+as\s+(reader|writer|commenter|editor))?\b', low
+    )
+    if m:
+        fid   = m.group(1)
+        email = m.group(2)
+        role  = (m.group(3) or "reader").replace("editor", "writer")
+        return _exec("share_file", {"file_id": fid, "email": email, "role": role},
+                     f"✅ Shared with <b>{email}</b> as <b>{role}</b>!")
+
+    # ── Share — contextual "share this with [email]" ─────────────────────────
+    m = re.search(
+        r'\bshare\s+(?:this|it|that|the\s+(?:last|current)\s+(?:one|file|folder))\s+'
+        r'(?:with\s+)?([\w.+-]+@[\w-]+\.[a-zA-Z]{2,})'
+        r'(?:\s+as\s+(reader|writer|commenter|editor))?\b', low
+    )
+    if m:
+        fid = _get_last_drive_id(state)
+        if fid:
+            email = m.group(1)
+            role  = (m.group(2) or "reader").replace("editor", "writer")
+            return _exec("share_file", {"file_id": fid, "email": email, "role": role},
+                         f"✅ Shared with <b>{email}</b> as <b>{role}</b>!")
+
+    # ── Share — intent without email → slot-fill ──────────────────────────────
+    if re.search(
+        r'\bshare\s+(?:this|it|that|the\s+(?:last|current)\s+(?:one|file|folder))\b', low
+    ) and not _EMAIL_RE.search(text):
+        fid = _get_last_drive_id(state)
+        if fid:
+            registry = state.get("entity_registry", {})
+            name = registry.get(fid, {}).get("name", fid)
+            role_m = re.search(r'\bas\s+(reader|writer|commenter|editor)\b', low)
+            role   = (role_m.group(1) if role_m else "reader").replace("editor", "writer")
+            state["pending_drive_action"] = {
+                "type": "share_file", "file_id": fid, "role": role
+            }
+            return f"Who should I share <b>{name}</b> with? Please provide their email address."
+
+    # ── Shareable link — explicit ID ──────────────────────────────────────────
+    m = re.search(
+        r'\b(?:get\s+(?:a\s+)?(?:shareable\s+)?link|make\s+(?:it\s+)?public|share\s+publicly)\s+'
+        r'(?:for\s+|of\s+)?(?:file\s+)?([A-Za-z0-9_-]{25,})\b', low
+    )
+    if not m:
+        m = re.search(
+            r'([A-Za-z0-9_-]{25,}).*?\b(?:shareable\s+link|public\s+link|anyone\s+with\s+link)\b',
+            low
+        )
+    if m:
+        fid = m.group(1)
+        return _exec("get_shareable_link", {"file_id": fid}, "🔗 Shareable link:")
+
+    # ── Shareable link — contextual ───────────────────────────────────────────
+    if re.search(
+        r'\b(?:get\s+(?:a\s+)?(?:shareable\s+)?link|shareable\s+link|public\s+link'
+        r'|make\s+(?:it\s+)?public|share\s+publicly)\b', low
+    ):
+        fid = _get_last_drive_id(state)
+        if fid:
+            registry = state.get("entity_registry", {})
+            name = registry.get(fid, {}).get("name", fid)
+            return _exec("get_shareable_link", {"file_id": fid},
+                         f"🔗 Shareable link for <b>{name}</b>:")
+
+    # ── Remove access ─────────────────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:remove|revoke)\s+(?:access\s+)?(?:for\s+|from\s+)?'
+        r'([\w.+-]+@[\w-]+\.[a-zA-Z]{2,})\s*(?:from\s+|for\s+)?'
+        r'(?:file\s+)?([A-Za-z0-9_-]{25,})?\b', low
+    )
+    if m:
+        email = m.group(1)
+        fid   = m.group(2) or _get_last_drive_id(state)
+        if fid:
+            return _exec("remove_access", {"file_id": fid, "email": email},
+                         f"🚫 Access removed for <b>{email}</b>.")
+
+    # ── Make private — explicit ID ────────────────────────────────────────────
+    m = re.search(
+        r'\b(?:make|set)\s+(?:file\s+|folder\s+)?([A-Za-z0-9_-]{25,})\s+'
+        r'(?:private|restricted)\b', low
+    )
+    if m:
+        return _exec("make_file_private", {"file_id": m.group(1)}, "🔒 File made private!")
+
+    # ── Make private — contextual ─────────────────────────────────────────────
+    if re.search(
+        r'\b(?:make|set)\s+(?:this|it|that)\s+(?:private|restricted)\b'
+        r'|\bremove\s+public\s+access\b', low
+    ):
+        fid = _get_last_drive_id(state)
+        if fid:
+            return _exec("make_file_private", {"file_id": fid}, "🔒 File is now private!")
+
+    return None  # fall through to LLM
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Google Sheets intent router  (zero-latency fast path)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sheets_intent_detect(text: str, mcp, state: dict) -> Optional[str]:
     """Return an HTML reply string, or None to fall through to the LLM."""
+    text = _resolve_refs(text, state)
     low  = text.lower().strip()
     sids = state.get("last_viewed_sheet_ids", [])
 
@@ -1474,7 +3061,7 @@ def _sheets_intent_detect(text: str, mcp, state: dict) -> Optional[str]:
         r'(?:google\s+)?(?:sheets?|spreadsheets?)\b', low
     ) or low in {"sheets", "spreadsheets", "my sheets", "recent sheets"}:
         res = mcp.execute_tool("list_sheets", {"limit": 10})
-        ids = [s["id"] for s in (res.get("result") or []) if isinstance(s, dict)]
+        ids = _register_entities(state, "list_sheets", res)
         state["last_viewed_sheet_ids"] = ids
         return f"Your recent spreadsheets:<br><br>{_fmt_sheets(res)}"
 
@@ -1644,6 +3231,117 @@ def _sheets_intent_detect(text: str, mcp, state: dict) -> Optional[str]:
     return None  # fall through to LLM
 
 
+_DRIVE_SYSTEM_PROMPT = """\
+You are G-Assistant operating in Google Drive MCP mode.
+
+Context:
+- Date: {current_date}
+
+Known Drive entities (files/folders seen this session):
+{entity_context}
+
+TOOL CALLING FORMAT — output ONLY valid JSON, nothing else:
+```json
+{{"tool": "TOOL_NAME", "args": {{"key": "value"}}}}
+```
+
+CONTEXTUAL REFERENCE RULES (critical):
+- "this" / "it" / "that" / "the last one" / "the folder" / "the file"
+  → use the FIRST ID from Known Drive entities above.
+- "delete/trash/rename/copy/share this" with no explicit ID
+  → always resolve to the most recent entity ID, never ask for clarification if an ID is available.
+- Never ask the user to provide an ID if one exists in the context above.
+
+TOOL NAME RULES (critical — wrong names cause failures):
+- To send to trash → trash_file       (NOT delete_folder, NOT remove_file)
+- To permanently delete → delete_file (NOT trash_file)
+- To restore from trash → restore_file
+- To rename → rename_file             (NOT rename_folder)
+- For sharing → share_file            (NOT share_folder)
+- For "editor" access → role = "writer"
+
+FILE ID EXTRACTION:
+- Raw ID in message (25+ alphanumeric/dash/underscore chars) → use it directly
+- Drive URL → extract ID from /d/FILE_ID/ or /folders/FOLDER_ID/ pattern
+- "it"/"this"/"that" → use first ID from known entities above
+- Named reference (e.g. "the nnn folder") → use matching ID from known entities
+
+AVAILABLE TOOLS:
+{tool_list}
+
+TOOL GUIDE:
+- list_files(limit, folder_id)                       → list all files (any type)
+- list_folders(limit)                                → list only folders
+- get_folder_contents(folder_id, limit)              → contents of a specific folder
+- get_starred_files(limit)                           → starred/favourited files
+- get_recent_files(limit)                            → most recently modified files
+- search_files(query, limit)                         → search by name or content
+- search_files_by_type(file_type, limit)             → filter: doc/sheet/pdf/image/folder/slides
+- get_file_metadata(file_id)                         → full metadata for a file or folder
+- get_storage_info()                                 → Drive storage usage / quota
+- create_folder(name, parent_id)                     → create a new folder
+- rename_file(file_id, new_name)                     → rename any file or folder
+- move_file(file_id, destination_folder_id)          → move into another folder
+- copy_file(file_id, new_name, destination_folder_id)→ copy a file
+- trash_file(file_id)                                → move to Drive trash (recoverable)
+- restore_file(file_id)                              → restore from trash
+- delete_file(file_id)                               → permanently delete (irreversible)
+- get_file_permissions(file_id)                      → list all sharing permissions
+- share_file(file_id, email, role)                   → share with user (reader/writer/commenter)
+- share_file_publicly(file_id, role)                 → make accessible to anyone with link
+- get_shareable_link(file_id)                        → get/create a public shareable link
+- remove_permission(file_id, permission_id)          → remove one permission by ID
+- remove_access(file_id, email)                      → remove access for a specific email
+- make_file_private(file_id)                         → strip all public sharing
+- upload_file(file_path, folder_id, file_name)       → upload a local file to Drive
+
+CRITICAL RULES:
+1. Output ONLY a JSON tool call — no prose, no explanation.
+2. NEVER use made-up tool names like delete_folder, remove_file, share_folder.
+3. NEVER ask for the file ID if one exists in known entities above.
+4. NEVER refuse a Drive request — always attempt the tool call.
+5. Redirect ONLY for requests completely unrelated to Drive (e.g. "send email").
+   Redirect with: "I'm in **Drive MCP** mode — switch to another mode in the sidebar."
+
+EXAMPLES — contextual (most important):
+0a. (known entity: 1ignuaoCaioJmgDwmd… | Folder | "nnn")
+    User: "delete this folder"
+    → {{"tool": "trash_file", "args": {{"file_id": "1ignuaoCaioJmgDwmd..."}}}}
+
+0b. (same entity)
+    User: "rename this to Projects"
+    → {{"tool": "rename_file", "args": {{"file_id": "1ignuaoCaioJmgDwmd...", "new_name": "Projects"}}}}
+
+0c. (same entity)
+    User: "share this with bob@example.com as editor"
+    → {{"tool": "share_file", "args": {{"file_id": "1ignuaoCaioJmgDwmd...", "email": "bob@example.com", "role": "writer"}}}}
+
+0d. (same entity)
+    User: "get a shareable link"
+    → {{"tool": "get_shareable_link", "args": {{"file_id": "1ignuaoCaioJmgDwmd..."}}}}
+
+EXAMPLES — explicit ID:
+1.  User: "list my files" → {{"tool": "list_files", "args": {{"limit": 15}}}}
+2.  User: "show folders" → {{"tool": "list_folders", "args": {{"limit": 20}}}}
+3.  User: "search budget" → {{"tool": "search_files", "args": {{"query": "budget", "limit": 10}}}}
+4.  User: "find all PDFs" → {{"tool": "search_files_by_type", "args": {{"file_type": "pdf", "limit": 10}}}}
+5.  User: "info on 1Ffeoo..." → {{"tool": "get_file_metadata", "args": {{"file_id": "1Ffeoo..."}}}}
+6.  User: "storage usage" → {{"tool": "get_storage_info", "args": {{}}}}
+7.  User: "create folder Projects" → {{"tool": "create_folder", "args": {{"name": "Projects"}}}}
+8.  User: "rename 1Ffeoo... to Q4 Report" → {{"tool": "rename_file", "args": {{"file_id": "1Ffeoo...", "new_name": "Q4 Report"}}}}
+9.  User: "move 1Ffeoo... to 1Ksdp..." → {{"tool": "move_file", "args": {{"file_id": "1Ffeoo...", "destination_folder_id": "1Ksdp..."}}}}
+10. User: "copy 1Ffeoo... as Backup" → {{"tool": "copy_file", "args": {{"file_id": "1Ffeoo...", "new_name": "Backup"}}}}
+11. User: "trash 1Ffeoo..." → {{"tool": "trash_file", "args": {{"file_id": "1Ffeoo..."}}}}
+12. User: "restore 1Ffeoo..." → {{"tool": "restore_file", "args": {{"file_id": "1Ffeoo..."}}}}
+13. User: "permanently delete 1Ffeoo..." → {{"tool": "delete_file", "args": {{"file_id": "1Ffeoo..."}}}}
+14. User: "who has access to 1Ffeoo..." → {{"tool": "get_file_permissions", "args": {{"file_id": "1Ffeoo..."}}}}
+15. User: "share 1Ffeoo... with alice@x.com as writer" → {{"tool": "share_file", "args": {{"file_id": "1Ffeoo...", "email": "alice@x.com", "role": "writer"}}}}
+16. User: "get shareable link for 1Ffeoo..." → {{"tool": "get_shareable_link", "args": {{"file_id": "1Ffeoo..."}}}}
+17. User: "remove alice@x.com from 1Ffeoo..." → {{"tool": "remove_access", "args": {{"file_id": "1Ffeoo...", "email": "alice@x.com"}}}}
+18. User: "make 1Ffeoo... private" → {{"tool": "make_file_private", "args": {{"file_id": "1Ffeoo..."}}}}
+"""
+
+
 _MODE_NAMES: dict[str, str] = {
     "drive": "Google Drive MCP",
 }
@@ -1684,48 +3382,106 @@ def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
     image_state = state.pop("last_image", None)      # consumed here; web.py sets this
     attachment  = _has_attachment(user_input, image_state)
 
+    # ── Cross-mode context bridge ─────────────────────────────────────────────
+    # When the user switches to a new mode, carry a one-line summary of what
+    # happened in the previous mode so the LLM retains cross-mode references
+    # (e.g. "that email I was working on" from General mode).
+    prev_mode = state.get("_active_mode")
+    if prev_mode and prev_mode != mode:
+        prev_hist = state.get(f"history_{prev_mode}", [])
+        # Collect the last few non-system turns from the previous mode
+        prev_turns = [m for m in prev_hist if m.get("role") in ("user", "assistant")][-6:]
+        if prev_turns:
+            bridge_facts = []
+            for m in prev_turns:
+                c = m.get("content", "")
+                if isinstance(c, str) and not c.startswith("SYSTEM CORRECTION") \
+                        and not c.startswith("Tool result"):
+                    bridge_facts.append(f"[{m['role']}]: {c[:100]}")
+            if bridge_facts:
+                state["_cross_mode_context"] = (
+                    f"Context from previous {prev_mode} session: "
+                    + " | ".join(bridge_facts)
+                )
+        else:
+            state.pop("_cross_mode_context", None)
+    state["_active_mode"] = mode
+
+    # ── Ensure history exists before intent routing so we can always log ────
+    _hist_key_early = f"history_{mode}"
+    if _hist_key_early not in state:
+        # Build a minimal system prompt stub — it will be overwritten below
+        state[_hist_key_early] = [{"role": "system", "content": ""}]
+
     # ── Fast path: intent routers (bypassed when a file is attached) ─────────
     if mode == "gmail" and not attachment:
         intent_reply = _intent_detect(user_input, mcp, state)
         if intent_reply is not None:
+            _append_to_history(state[_hist_key_early], "user", user_input)
+            _append_to_history(state[_hist_key_early], "assistant", intent_reply)
             return intent_reply
 
     if mode == "docs" and not attachment:
         intent_reply = _docs_intent_detect(user_input, mcp, state)
         if intent_reply is not None:
+            _append_to_history(state[_hist_key_early], "user", user_input)
+            _append_to_history(state[_hist_key_early], "assistant", intent_reply)
             return intent_reply
 
     if mode == "sheets" and not attachment:
         intent_reply = _sheets_intent_detect(user_input, mcp, state)
         if intent_reply is not None:
+            _append_to_history(state[_hist_key_early], "user", user_input)
+            _append_to_history(state[_hist_key_early], "assistant", intent_reply)
+            return intent_reply
+
+    # ── Drive: handle file uploads before the no-attachment gate ────────────
+    if mode == "drive" and attachment:
+        upload_reply = _drive_upload_handler(user_input, mcp, state)
+        if upload_reply is not None:
+            _append_to_history(state[_hist_key_early], "user", user_input)
+            _append_to_history(state[_hist_key_early], "assistant", upload_reply)
+            return upload_reply
+
+    if mode == "drive" and not attachment:
+        intent_reply = _drive_intent_detect(user_input, mcp, state)
+        if intent_reply is not None:
+            _append_to_history(state[_hist_key_early], "user", user_input)
+            _append_to_history(state[_hist_key_early], "assistant", intent_reply)
             return intent_reply
 
     # ── Build mode-specific system prompt ────────────────────────────────────
+    entity_ctx = _entity_context_str(state)
     if mode == "gmail":
         tool_list  = "\n".join(f"- {k}" for k in GMAIL_TOOLS)
-        v_ids      = state.get("last_viewed_ids", [])
         d_id       = state.get("last_draft_id", "None")
         sys_prompt = _GMAIL_SYSTEM_PROMPT.format(
             current_date=now_str,
-            viewed_ids=", ".join(v_ids) if v_ids else "None",
+            entity_context=entity_ctx,
             last_draft_id=d_id,
             last_to=state.get("last_to") or "None",
+            last_subject=state.get("last_subject") or "None",
             tool_list=tool_list,
         )
     elif mode == "docs":
         tool_list  = "\n".join(f"- {k}" for k in DOCS_TOOLS)
-        d_ids      = state.get("last_viewed_doc_ids", [])
         sys_prompt = _DOCS_SYSTEM_PROMPT.format(
             current_date=now_str,
-            viewed_doc_ids=", ".join(d_ids) if d_ids else "None",
+            entity_context=entity_ctx,
             tool_list=tool_list,
         )
     elif mode == "sheets":
         tool_list  = "\n".join(f"- {k}" for k in SHEETS_TOOLS)
-        s_ids      = state.get("last_viewed_sheet_ids", [])
         sys_prompt = _SHEETS_SYSTEM_PROMPT.format(
             current_date=now_str,
-            viewed_sheet_ids=", ".join(s_ids) if s_ids else "None",
+            entity_context=entity_ctx,
+            tool_list=tool_list,
+        )
+    elif mode == "drive":
+        tool_list  = "\n".join(f"- {k}" for k in DRIVE_TOOLS)
+        sys_prompt = _DRIVE_SYSTEM_PROMPT.format(
+            current_date=now_str,
+            entity_context=entity_ctx,
             tool_list=tool_list,
         )
     elif mode == "general":
@@ -1738,6 +3494,11 @@ def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
             else _COMING_SOON_PROMPT.format(current_date=now_str, mode_name=mode_name)
         )
 
+    # ── Append cross-mode context to system prompt if switching modes ────────
+    cross_ctx = state.get("_cross_mode_context", "")
+    if cross_ctx and prev_mode and prev_mode != mode:
+        sys_prompt = sys_prompt + f"\n\n{cross_ctx}"
+
     # ── Per-mode conversation history ─────────────────────────────────────────
     hist_key = f"history_{mode}"
     if hist_key not in state:
@@ -1747,17 +3508,21 @@ def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
 
     history = state[hist_key]
 
+    # ── Semantically enrich the user message before sending to LLM ──────────
+    # Reference resolver may append entity hints like "[entity: abc123 — 'Invoice Q4']"
+    enriched_input = _resolve_refs(user_input, state)
+
     # ── Build user message (vision block or plain text) ───────────────────────
     if image_state:
         vision_content = [
-            {"type": "text", "text": user_input},
+            {"type": "text", "text": enriched_input},
             {"type": "image_url", "image_url": {
                 "url": f"data:{image_state['mime']};base64,{image_state['data']}"
             }}
         ]
         history.append({"role": "user", "content": vision_content})
     else:
-        _append_to_history(history, "user", user_input)
+        _append_to_history(history, "user", enriched_input)
 
     # ── Trim history to avoid context overflow ────────────────────────────────
     trimmed = _trim_history(history)
@@ -1782,6 +3547,9 @@ def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
             resp    = call_model(history)
             llm_msg = resp.get("choices", [{}])[0].get("message", {})
             content = llm_msg.get("content") or ""
+            # Strip <think>…</think> blocks emitted by reasoning models (DeepSeek-R1, QwQ, etc.)
+            # before parsing tool calls, saving to history, or showing to the user.
+            content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
 
             # Slim down vision entry after first successful call
             if image_state and not vision_slimmed:
@@ -1792,8 +3560,8 @@ def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
             _append_to_history(history, "assistant",
                                content if isinstance(content, str) else json.dumps(content))
 
-            # Tool execution (Gmail, Docs, Sheets modes)
-            if mode in ("gmail", "docs", "sheets") and isinstance(content, str):
+            # Tool execution (Gmail, Docs, Sheets, Drive modes)
+            if mode in ("gmail", "docs", "sheets", "drive") and isinstance(content, str):
                 tool_call = _parse_tool_call(content)
                 if tool_call:
                     tool_name = tool_call["tool"]
@@ -1806,38 +3574,49 @@ def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
 
                     res = mcp.execute_tool(tool_name, args)
 
-                    # Gmail-specific: cache draft ID
-                    if mode == "gmail" and tool_name == "draft_email" and isinstance(res, dict):
-                        did = (res.get("result") or {}).get("id") if isinstance(res.get("result"), dict) else None
-                        if did:
-                            state["last_draft_id"] = did
+                    # ── Update entity registry for ALL modes ─────────────────
+                    new_ids = _register_entities(state, tool_name, res)
+
+                    # Gmail-specific: cache viewed IDs, draft ID, and last-sent details
+                    if mode == "gmail":
+                        if new_ids and tool_name not in ("send_email", "draft_email",
+                                                          "reply_email", "forward_email"):
+                            state["last_viewed_ids"] = new_ids
+                        if tool_name == "draft_email" and isinstance(res, dict):
+                            did = (res.get("result") or {}).get("id") if isinstance(res.get("result"), dict) else None
+                            if did:
+                                state["last_draft_id"] = did
+                            # Save recipient/subject/body so "send again" works
+                            state.update(
+                                last_to=args.get("to", state.get("last_to")),
+                                last_subject=args.get("subject", state.get("last_subject")),
+                                last_body=args.get("body", state.get("last_body")),
+                            )
+                        if tool_name == "send_email":
+                            state.update(
+                                last_to=args.get("to", state.get("last_to")),
+                                last_subject=args.get("subject", state.get("last_subject")),
+                                last_body=args.get("body", state.get("last_body")),
+                            )
 
                     # Docs-specific: cache last viewed doc IDs
-                    if mode == "docs" and isinstance(res, dict):
-                        result_data = res.get("result")
-                        if isinstance(result_data, list):
-                            ids = [d["id"] for d in result_data if isinstance(d, dict) and "id" in d]
-                            if ids:
-                                state["last_viewed_doc_ids"] = ids
-                        elif isinstance(result_data, dict) and "id" in result_data:
-                            state["last_viewed_doc_ids"] = [result_data["id"]]
+                    if mode == "docs" and new_ids:
+                        state["last_viewed_doc_ids"] = new_ids
 
                     # Sheets-specific: cache last viewed sheet IDs
-                    if mode == "sheets" and isinstance(res, dict):
-                        result_data = res.get("result")
-                        if isinstance(result_data, list):
-                            ids = [s["id"] for s in result_data if isinstance(s, dict) and "id" in s]
-                            if ids:
-                                state["last_viewed_sheet_ids"] = ids
-                        elif isinstance(result_data, dict) and "id" in result_data:
-                            state["last_viewed_sheet_ids"] = [result_data["id"]]
+                    if mode == "sheets" and new_ids:
+                        state["last_viewed_sheet_ids"] = new_ids
 
-                    _append_to_history(history, "user", f"Tool result: {json.dumps(res)}")
+                    # Drive-specific: cache last viewed Drive file IDs
+                    if mode == "drive" and new_ids:
+                        state["last_viewed_drive_ids"] = new_ids
+
+                    _append_to_history(history, "user", _summarize_tool_result(tool_name, res))
                     continue  # next loop iteration → send tool result back to LLM
 
-            # Guard: if docs/sheets mode returns plain text with a refusal instead of
+            # Guard: if gmail/docs/sheets/drive mode returns plain text with a refusal instead of
             # a JSON tool call, re-inject a correction and retry (max 1 retry).
-            if mode in ("docs", "sheets") and isinstance(content, str) and _tool_refusals < 1:
+            if mode in ("gmail", "docs", "sheets", "drive") and isinstance(content, str) and _tool_refusals < 1:
                 lower = content.lower()
                 if any(phrase in lower for phrase in _REFUSAL_PHRASES):
                     _tool_refusals += 1
@@ -1866,18 +3645,16 @@ def run_agent(user_input: str, mcp, state: dict, mode: str = "gmail") -> str:
         _fmt_for_mode = (
             _fmt_docs   if mode == "docs"   else
             _fmt_sheets if mode == "sheets" else
+            _fmt_drive  if mode == "drive"  else
             _fmt
         )
         # Search backwards through history for the most recent tool result
         # (LLM may have appended an empty/assistant turn after the tool result)
         for _msg in reversed(history):
             _c = _msg.get("content", "")
-            if isinstance(_c, str) and "Tool result:" in _c:
-                try:
-                    _raw = _c.split("Tool result: ", 1)[1]
-                    reply_text = _fmt_for_mode(json.loads(_raw))
-                except (json.JSONDecodeError, ValueError, IndexError):
-                    reply_text = _c
+            if isinstance(_c, str) and _c.startswith("Tool result ("):
+                # New summarized format — show as-is (already human-readable)
+                reply_text = _c
                 break
         if not reply_text:
             reply_text = "I wasn't able to complete that. Please try rephrasing your request."
