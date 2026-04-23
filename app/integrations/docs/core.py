@@ -249,8 +249,20 @@ def append_to_doc(doc_id: str, text: str) -> dict:
 
 
 def replace_text_in_doc(doc_id: str, find: str, replace: str) -> dict:
-    """Find and replace all occurrences of a string in a document."""
+    """
+    Find and replace all occurrences of a string in a document.
+    
+    IMPORTANT: The 'find' text must match EXACTLY including whitespace and newlines.
+    If no matches are found, the function will return the actual document content
+    to help you see what text is actually in the document.
+    """
     service = authenticate_docs()
+    
+    # Get current document content first for feedback
+    doc = _api_call(lambda: service.documents().get(documentId=doc_id).execute())
+    current_text = _extract_text(doc, max_chars=10000)
+    
+    # Perform the replacement
     result  = _api_call(lambda: service.documents().batchUpdate(
         documentId=doc_id,
         body={"requests": [{
@@ -260,8 +272,25 @@ def replace_text_in_doc(doc_id: str, find: str, replace: str) -> dict:
             }
         }]},
     ).execute())
+    
     n = (result.get("replies") or [{}])[0].get("replaceAllText", {}).get("occurrencesChanged", 0)
-    return {"success": True, "occurrences_replaced": n}
+    
+    # Build helpful response
+    response = {
+        "success": n > 0,
+        "occurrences_replaced": n,
+        "find_text": find[:100] + "..." if len(find) > 100 else find,
+    }
+    
+    if n == 0:
+        # Provide helpful feedback when no matches
+        response["warning"] = "No matches found. The 'find' text must match EXACTLY."
+        response["document_content_preview"] = current_text[:500] + "..." if len(current_text) > 500 else current_text
+        response["suggestion"] = "Tips: (1) Check for extra spaces/newlines (2) Use doc_modify(action='clear') + doc_modify(action='append') for full replacement (3) Use replace_section() for heading-based replacement"
+    else:
+        response["message"] = f"Successfully replaced {n} occurrence(s) of text."
+    
+    return response
 
 
 # ─────────────────────────────────────────────────────────────────────────────

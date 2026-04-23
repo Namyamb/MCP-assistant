@@ -135,45 +135,161 @@ def normalize_email(raw_message):
 
 # Read APIs
 def get_emails(limit=20):
-    service = authenticate_gmail()
-    results = gmail_call(lambda: service.users().messages().list(userId='me', maxResults=limit).execute())
-    messages = results.get('messages', [])
-    emails = []
-    for msg in messages:
-        raw = fetch_message(service, msg['id'])
-        emails.append(normalize_email(raw))
-    return emails
+    """
+    Get recent emails from inbox.
+    
+    Returns:
+        dict: {
+            "success": True/False,
+            "emails": [...],
+            "count": N,
+            "error": "..." (if failed)
+        }
+    """
+    try:
+        service = authenticate_gmail()
+    except PermissionError as e:
+        return {
+            "success": False,
+            "emails": [],
+            "count": 0,
+            "error": f"Authentication error: {str(e)}"
+        }
+    
+    try:
+        results = gmail_call(lambda: service.users().messages().list(userId='me', maxResults=limit).execute())
+        messages = results.get('messages', [])
+        emails = []
+        for msg in messages:
+            try:
+                raw = fetch_message(service, msg['id'])
+                emails.append(normalize_email(raw))
+            except:
+                continue
+        return {
+            "success": True,
+            "emails": emails,
+            "count": len(emails)
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "emails": [],
+            "count": 0,
+            "error": f"Failed to get emails: {str(e)}"
+        }
 
 def get_email_by_id(message_id):
     service = authenticate_gmail()
     raw = fetch_message(service, message_id)
     return normalize_email(raw)
 
-def get_unread_emails():
-    return search_emails("is:unread", limit=10)
+def get_unread_emails(limit=10):
+    return search_emails("is:unread", limit=limit)
     
-def get_starred_emails(): 
-    return search_emails("is:starred", limit=10)
+def get_starred_emails(limit=10):
+    return search_emails("is:starred", limit=limit)
 
-def search_emails(query, limit=10): 
-    service = authenticate_gmail()
+def search_emails(query, limit=10):
+    """
+    Search emails using Gmail query syntax.
+    
+    Args:
+        query: Gmail search query (e.g., "from:glassdoor", "is:unread", "subject:invoice")
+        limit: Maximum number of results (default 10)
+    
+    Returns:
+        dict: {
+            "success": True/False,
+            "emails": [...],
+            "count": N,
+            "query": query,
+            "error": "..." (if failed)
+        }
+    """
+    try:
+        service = authenticate_gmail()
+    except PermissionError as e:
+        return {
+            "success": False,
+            "emails": [],
+            "count": 0,
+            "query": query,
+            "error": f"Authentication error: {str(e)}"
+        }
+    
     # Check if query is just a message ID
     if len(query) == 16 and re.match(r'^[a-fA-F0-9]+$', query):
         try:
-            return [get_email_by_id(query)]
-        except:
-            pass # continue to normal search
-            
-    results = gmail_call(lambda: service.users().messages().list(userId='me', maxResults=limit, q=query).execute())
-    messages = results.get('messages', [])
-    emails = []
-    for msg in messages:
-        try:
-            raw = fetch_message(service, msg['id'])
-            emails.append(normalize_email(raw))
-        except:
-            continue
-    return emails
+            email = get_email_by_id(query)
+            return {
+                "success": True,
+                "emails": [email],
+                "count": 1,
+                "query": query
+            }
+        except Exception as e:
+            return {
+                "success": False,
+                "emails": [],
+                "count": 0,
+                "query": query,
+                "error": f"Message ID lookup failed: {str(e)}"
+            }
+    
+    try:
+        results = gmail_call(lambda: service.users().messages().list(
+            userId='me', 
+            maxResults=limit, 
+            q=query
+        ).execute())
+        
+        messages = results.get('messages', [])
+        
+        if not messages:
+            return {
+                "success": True,
+                "emails": [],
+                "count": 0,
+                "query": query,
+                "message": f"No emails found matching query: '{query}'"
+            }
+        
+        emails = []
+        errors = 0
+        for msg in messages:
+            try:
+                raw = fetch_message(service, msg['id'])
+                emails.append(normalize_email(raw))
+            except Exception as e:
+                errors += 1
+                continue
+        
+        return {
+            "success": True,
+            "emails": emails,
+            "count": len(emails),
+            "query": query,
+            "errors_during_fetch": errors if errors > 0 else None
+        }
+        
+    except HttpError as e:
+        status = e.resp.status if hasattr(e, 'resp') else 0
+        return {
+            "success": False,
+            "emails": [],
+            "count": 0,
+            "query": query,
+            "error": f"Gmail API error ({status}): {str(e)}"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "emails": [],
+            "count": 0,
+            "query": query,
+            "error": f"Search failed: {str(e)}"
+        }
 
 def get_emails_by_sender(sender): 
     return search_emails(f"from:{sender}", limit=10)
@@ -181,7 +297,13 @@ def get_emails_by_sender(sender):
 def get_emails_by_label(label): 
     return search_emails(f"label:{label}", limit=10)
 
-def get_emails_by_date_range(start, end): 
+def get_emails_by_date_range(start, end):
+    # Gmail after:/before: are exclusive at midnight UTC.
+    # If start == end, user wants that single day; add 1 day to end so range is inclusive.
+    if start == end:
+        from datetime import datetime, timedelta
+        dt = datetime.strptime(start, "%Y/%m/%d")
+        end = (dt + timedelta(days=1)).strftime("%Y/%m/%d")
     return search_emails(f"after:{start} before:{end}", limit=10)
 
 def get_email_thread(thread_id):
@@ -252,17 +374,62 @@ def send_draft(draft_id):
         return {"error": str(e), "message": f"Failed to send draft {clean_id}. Make sure this is the draft_id, not the message_id."}
 
 def update_draft(draft_id, body):
+    """Update a draft by draft_id or message_id.
+    
+    If a message_id is passed, it will first try to find the corresponding draft.
+    """
     service = authenticate_gmail()
+    clean_id = str(draft_id).strip()
+    
+    # Try to find the actual draft ID if message ID was passed
+    actual_draft_id = clean_id
+    try:
+        drafts = gmail_call(lambda: service.users().drafts().list(userId='me').execute())
+        if drafts and 'drafts' in drafts:
+            for draft in drafts['drafts']:
+                if draft.get('message', {}).get('id') == clean_id:
+                    actual_draft_id = draft['id']
+                    break
+    except:
+        pass  # Continue with original ID if list fails
+    
     message = MIMEMultipart()
     msg = MIMEText(body)
     message.attach(msg)
     encoded = base64.urlsafe_b64encode(message.as_bytes()).decode()
     body_dict = {'message': {'raw': encoded}}
-    return gmail_call(lambda: service.users().drafts().update(userId='me', id=draft_id, body=body_dict).execute())
+    
+    try:
+        return gmail_call(lambda: service.users().drafts().update(userId='me', id=actual_draft_id, body=body_dict).execute())
+    except Exception as e:
+        return {"error": str(e), "message": f"Failed to update draft {clean_id}. Ensure this is a valid draft ID or message ID that has a draft."}
 
-def delete_draft(draft_id): 
+def delete_draft(draft_id):
+    """Delete a draft by draft_id or message_id.
+    
+    If a message_id is passed, it will first try to find the corresponding draft.
+    """
     service = authenticate_gmail()
-    return gmail_call(lambda: service.users().drafts().delete(userId='me', id=draft_id).execute())
+    clean_id = str(draft_id).strip()
+    
+    try:
+        # First, try to delete as draft_id directly
+        return gmail_call(lambda: service.users().drafts().delete(userId='me', id=clean_id).execute())
+    except Exception as e:
+        error_str = str(e)
+        # If draft not found, try to find draft by message ID
+        if 'not found' in error_str.lower() or '404' in error_str:
+            try:
+                drafts = gmail_call(lambda: service.users().drafts().list(userId='me').execute())
+                if drafts and 'drafts' in drafts:
+                    for draft in drafts['drafts']:
+                        if draft.get('message', {}).get('id') == clean_id:
+                            # Found the draft for this message
+                            return gmail_call(lambda: service.users().drafts().delete(userId='me', id=draft['id']).execute())
+                return {"error": f"Draft not found for ID: {clean_id}", "message": "No draft exists with this ID. The message ID may not have a corresponding draft."}
+            except Exception as inner_e:
+                return {"error": str(inner_e), "message": f"Failed to find and delete draft for ID: {clean_id}"}
+        return {"error": error_str, "message": f"Failed to delete draft {clean_id}"}
 
 def reply_email(message_id, body):
     service = authenticate_gmail()
@@ -304,13 +471,55 @@ def list_labels():
     res = gmail_call(lambda: service.users().labels().list(userId='me').execute())
     return res.get('labels', [])
 
+def delete_label(label_name):
+    """Delete a Gmail label by name. Looks up the label ID first, then deletes it."""
+    service = authenticate_gmail()
+    labels  = list_labels()
+    # Exact match first, then case-insensitive substring fallback
+    target = next(
+        (l for l in labels if l.get("name", "").lower() == label_name.lower()),
+        None,
+    ) or next(
+        (l for l in labels if label_name.lower() in l.get("name", "").lower()),
+        None,
+    )
+    if not target:
+        raise ValueError(f"Label '{label_name}' not found. Use 'list labels' to see available labels.")
+    if target.get("type") == "system":
+        raise ValueError(f"'{target['name']}' is a system label and cannot be deleted.")
+    gmail_call(lambda: service.users().labels().delete(userId='me', id=target["id"]).execute())
+    return f"Label '{target['name']}' deleted successfully."
+
+
 def _modify_labels(message_id, add_labels, remove_labels):
     service = authenticate_gmail()
     body = {'addLabelIds': add_labels, 'removeLabelIds': remove_labels}
     return gmail_call(lambda: service.users().messages().modify(userId='me', id=message_id, body=body).execute())
 
-def add_label(message_id, label): return _modify_labels(message_id, [label], [])
-def remove_label(message_id, label): return _modify_labels(message_id, [], [label])
+def _get_label_id(service, label_name):
+    """Resolve label name to ID. Returns the ID or None if not found."""
+    try:
+        labels = gmail_call(lambda: service.users().labels().list(userId='me').execute())
+        for lbl in labels.get('labels', []):
+            if lbl.get('name', '').lower() == label_name.lower():
+                return lbl['id']
+        return None
+    except:
+        return None
+
+def add_label(message_id, label):
+    service = authenticate_gmail()
+    label_id = _get_label_id(service, label)
+    if not label_id:
+        return {"error": f"Label '{label}' not found. Use 'list labels' to see available labels."}
+    return _modify_labels(message_id, [label_id], [])
+
+def remove_label(message_id, label):
+    service = authenticate_gmail()
+    label_id = _get_label_id(service, label)
+    if not label_id:
+        return {"error": f"Label '{label}' not found. Use 'list labels' to see available labels."}
+    return _modify_labels(message_id, [], [label_id])
 def create_label(label_name):
     service = authenticate_gmail()
     body = {
@@ -346,41 +555,73 @@ def move_to_folder(message_id, folder):
     # We remove INBOX and add the target label.
     return _modify_labels(message_id, [folder], ['INBOX'])
 
+def _validate_message_id(mid: str) -> str:
+    """
+    Gmail message IDs are hex strings (e.g. 18e7a3c9f1b2d4e5).
+    Reject anything that is clearly not a Gmail ID so we get a clear error
+    instead of a confusing 400 from the API.
+    """
+    mid = str(mid).strip()
+    import re as _re
+    # Must be 10-32 chars, hex only
+    if not _re.fullmatch(r'[a-fA-F0-9]{10,32}', mid):
+        raise ValueError(
+            f"'{mid}' does not look like a valid Gmail message ID. "
+            "Gmail IDs are hex strings (e.g. 18e7a3c9f1b2d4e5). "
+            "Use 'show my emails' to see real IDs."
+        )
+    return mid
+
+
 def trash_email(message_id=None, id=None):
     """Accept 'message_id' or 'id' to be robust against LLM arg naming."""
     target = message_id or id
     if not target:
-        raise ValueError("message_id is required")
-    service = authenticate_gmail()
-    ids = target if isinstance(target, (list, tuple)) else [target]
-    results = []
-    for mid in ids:
-        mid_str = str(mid).strip()
-        res = gmail_call(lambda m=mid_str: service.users().messages().trash(userId='me', id=m).execute())
-        results.append(res)
-    return results if len(results) > 1 else results[0]
+        return {"success": False, "error": "message_id is required"}
+    try:
+        service = authenticate_gmail()
+        ids = target if isinstance(target, (list, tuple)) else [target]
+        results = []
+        for mid in ids:
+            mid_str = _validate_message_id(mid)
+            res = gmail_call(lambda m=mid_str: service.users().messages().trash(userId='me', id=m).execute())
+            results.append(res)
+        return {"success": True, "result": results if len(results) > 1 else results[0]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 def restore_email(message_id=None, id=None):
     target = message_id or id
-    service = authenticate_gmail()
-    ids = target if isinstance(target, (list, tuple)) else [target]
-    results = []
-    for mid in ids:
-        mid_str = str(mid).strip()
-        res = gmail_call(lambda m=mid_str: service.users().messages().untrash(userId='me', id=m).execute())
-        results.append(res)
-    return results if len(results) > 1 else results[0]
+    if not target:
+        return {"success": False, "error": "message_id is required"}
+    try:
+        service = authenticate_gmail()
+        ids = target if isinstance(target, (list, tuple)) else [target]
+        results = []
+        for mid in ids:
+            mid_str = _validate_message_id(mid)
+            res = gmail_call(lambda m=mid_str: service.users().messages().untrash(userId='me', id=m).execute())
+            results.append(res)
+        return {"success": True, "result": results if len(results) > 1 else results[0]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 def delete_email(message_id=None, id=None):
+    """Permanently delete email - NOT the same as trash! Use trash_email to move to trash."""
     target = message_id or id
-    service = authenticate_gmail()
-    ids = target if isinstance(target, (list, tuple)) else [target]
-    results = []
-    for mid in ids:
-        mid_str = str(mid).strip()
-        res = gmail_call(lambda m=mid_str: service.users().messages().delete(userId='me', id=m).execute())
-        results.append(res)
-    return results if len(results) > 1 else results[0]
+    if not target:
+        return {"success": False, "error": "message_id is required"}
+    try:
+        service = authenticate_gmail()
+        ids = target if isinstance(target, (list, tuple)) else [target]
+        results = []
+        for mid in ids:
+            mid_str = _validate_message_id(mid)
+            res = gmail_call(lambda m=mid_str: service.users().messages().delete(userId='me', id=m).execute())
+            results.append(res)
+        return {"success": True, "result": results if len(results) > 1 else results[0]}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
 
 def get_attachments(message_id):
     service = authenticate_gmail()
@@ -407,15 +648,37 @@ def get_attachments(message_id):
 def save_attachment_to_disk(message_id, attachment_id, filename):
     from app.core.config import DATA_DIR
     service = authenticate_gmail()
-    res = gmail_call(lambda: service.users().messages().attachments().get(
-        userId='me', messageId=message_id, id=attachment_id).execute())
     
-    data = base64.urlsafe_b64decode(res['data'])
-    path = DATA_DIR / "downloads"
-    path.mkdir(exist_ok=True)
-    target = path / filename
-    target.write_bytes(data)
-    return {"success": True, "path": str(target), "size": len(data)}
+    # First verify the message exists and check for attachments
+    try:
+        msg = fetch_message(service, message_id)
+        attachments = get_attachments(message_id)
+        
+        if not attachments:
+            return {"error": f"No attachments found on message {message_id}", "attachments": []}
+        
+        # Verify the attachment_id exists on this message
+        valid_ids = [a['id'] for a in attachments]
+        if attachment_id not in valid_ids:
+            return {
+                "error": f"Attachment ID '{attachment_id}' not found on message {message_id}",
+                "available_attachments": attachments
+            }
+    except Exception as e:
+        return {"error": f"Failed to verify message/attachments: {str(e)}"}
+    
+    try:
+        res = gmail_call(lambda: service.users().messages().attachments().get(
+            userId='me', messageId=message_id, id=attachment_id).execute())
+        
+        data = base64.urlsafe_b64decode(res['data'])
+        path = DATA_DIR / "downloads"
+        path.mkdir(exist_ok=True)
+        target = path / filename
+        target.write_bytes(data)
+        return {"success": True, "path": str(target), "size": len(data)}
+    except Exception as e:
+        return {"error": f"Failed to download attachment: {str(e)}"}
 
 download_attachment = save_attachment_to_disk
 
@@ -466,5 +729,4 @@ def audit_email_history():
 
 # Remaining Placeholders
 def schedule_email(to, subject, body, send_at): return {"error": "Scheduling requires local cron/task setup. Coming soon."}
-def set_email_reminder(message_id, remind_at, note): return {"error": "Reminders require local task-scheduler integration."}
 def confirm_action(action, target): return True

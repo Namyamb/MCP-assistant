@@ -6,7 +6,7 @@ from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from app.core.config import WEB_HOST, WEB_PORT, PROJECT_ROOT, DATA_DIR
 from app.integrations.gmail.core import get_emails, get_email_by_id
-from app.core.orchestrator import run_agent
+from app.core.orchestrator import run_agent, reset_mode_context
 
 
 STATIC_DIR = PROJECT_ROOT / "app" / "ui" / "static"
@@ -76,7 +76,16 @@ class AgentHTTPRequestHandler(SimpleHTTPRequestHandler):
             self.send_json({"status": "ok"})
         elif parsed_path.path == '/api/inbox':
             try:
-                emails = get_emails(limit=20)
+                result = get_emails(limit=20)
+                # Handle both old list format and new dict format
+                if isinstance(result, dict):
+                    if not result.get("success", True):
+                        self.send_error(500, result.get("error", "Failed to fetch emails"))
+                        return
+                    emails = result.get("emails", [])
+                else:
+                    # Legacy list format
+                    emails = result if isinstance(result, list) else []
                 self.send_json({"emails": emails})
             except PermissionError as e:
                 self.send_error(401, str(e))
@@ -101,16 +110,8 @@ class AgentHTTPRequestHandler(SimpleHTTPRequestHandler):
             try:
                 length = int(self.headers.get('Content-Length', 0))
                 data = json.loads(self.rfile.read(length).decode('utf-8')) if length else {}
-                mode = data.get('mode', 'gmail')
-                agent_state.pop(f"history_{mode}", None)
-                # Clear integration-specific state when leaving a mode
-                if mode == "docs":
-                    agent_state.pop("last_viewed_doc_ids", None)
-                if mode == "sheets":
-                    agent_state.pop("last_viewed_sheet_ids", None)
-                if mode == "drive":
-                    agent_state.pop("last_viewed_drive_ids", None)
-                # Also clear any pending attachment state
+                mode = data.get('mode', 'unified')  # Default: all tools (Gmail, Drive, Docs, Sheets)
+                reset_mode_context(agent_state, mode)
                 agent_state.pop("last_image", None)
                 agent_state.pop("last_attachment_path", None)
                 self.send_json({"ok": True})
@@ -126,7 +127,7 @@ class AgentHTTPRequestHandler(SimpleHTTPRequestHandler):
                 data = json.loads(self.rfile.read(length).decode('utf-8'))
                 msg  = data.get('message', '')
                 attachment = data.get('attachment')
-                mode = data.get('mode', 'gmail')
+                mode = data.get('mode', 'unified')  # Default: all tools (Gmail, Drive, Docs, Sheets)
 
                 if attachment:
                     ups = DATA_DIR / "uploads"
