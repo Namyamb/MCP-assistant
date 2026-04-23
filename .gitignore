@@ -45,3 +45,9 @@ data/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Graphify and Temp
+.graphify*
+graphify-out/
+test_results/
+write_chunks_temp.py

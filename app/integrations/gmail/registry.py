@@ -1,7 +1,51 @@
-from app.integrations.gmail import core, ai
+"""
+Gmail MCP Tools Registry v2
+
+Provides 50+ tools including:
+- v1 compatible tools (core, ai)
+- v2 unified tools (core_v2)
+- ID resolution tools
+- Batch operations
+- Advanced search
+"""
+
+from app.integrations.gmail import core, ai, core_v2
 
 GMAIL_TOOLS = {
-    # Core tools
+    # ═══════════════════════════════════════════════════════════════════════
+    # V2 UNIFIED TOOLS (Recommended - reduces fragmentation)
+    # ═══════════════════════════════════════════════════════════════════════
+    "resolve_email_id":      core_v2.resolve_email_id,
+    "resolve_draft_id":      core_v2.resolve_draft_id,
+    "email_action":          core_v2.email_action,
+    "email_modify":          core_v2.email_modify,
+    "email_generate":        core_v2.email_generate,
+    "email_analyze":         core_v2.email_analyze,
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # V2 PAGINATED GETTERS
+    # ═══════════════════════════════════════════════════════════════════════
+    "get_emails_v2":         core_v2.get_emails,
+    "search_emails_v2":      core_v2.search_emails,
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # V2 BATCH OPERATIONS
+    # ═══════════════════════════════════════════════════════════════════════
+    "batch_email_action":    core_v2.batch_email_action,
+    "archive_emails":        core_v2.archive_emails,
+    "trash_emails":          core_v2.trash_emails,
+    "delete_emails":         core_v2.delete_emails,
+    "mark_emails_read":      core_v2.mark_emails_read,
+    "star_emails":           core_v2.star_emails,
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # V2 UTILITY
+    # ═══════════════════════════════════════════════════════════════════════
+    "get_gmail_stats":       core_v2.get_gmail_stats,
+    "clear_gmail_cache":     core_v2.clear_gmail_cache,
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # V1 Core tools (backward compatible)
     "authenticate_gmail": core.authenticate_gmail,
     "get_emails": core.get_emails,
     "get_email_by_id": core.get_email_by_id,
@@ -25,6 +69,7 @@ GMAIL_TOOLS = {
     "add_label": core.add_label,
     "remove_label": core.remove_label,
     "create_label": core.create_label,
+    "delete_label": core.delete_label,
     "mark_as_read": core.mark_as_read,
     "mark_as_unread": core.mark_as_unread,
     "star_email": core.star_email,
@@ -39,7 +84,6 @@ GMAIL_TOOLS = {
     "download_attachment": core.download_attachment,
     "save_attachment_to_disk": core.save_attachment_to_disk,
     "schedule_email": core.schedule_email,
-    "set_email_reminder": core.set_email_reminder,
     "confirm_action": core.confirm_action,
     "validate_email_address": core.validate_email_address,
     "sanitize_email_content": core.sanitize_email_content,
